@@ -1,0 +1,47 @@
+{
+  "name": "zeep-api",
+  "version": "0.1.0",
+  "description": "Zeep backend: gateway, RLN verifier, treasury worker",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "migrate": "node dist/migrate.js",
+    "migrate:dev": "tsx src/migrate.ts",
+    "treasury": "node dist/workers/treasury.js",
+    "test": "tsx --test test/unit.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:e2e": "cargo build --manifest-path rust/Cargo.toml && tsx --test --test-concurrency=1 test/e2e.test.ts",
+    "circuits": "./scripts/setup-circuit.sh",
+    "typecheck:sdk": "tsc -p sdk/tsconfig.json"
+  },
+  "dependencies": {
+    "@defuse-protocol/one-click-sdk-typescript": "^0.1.26",
+    "@fastify/cors": "^11.3.1",
+    "@noble/hashes": "^1.8.0",
+    "@scure/bip39": "^1.6.0",
+    "bullmq": "^6.3.18",
+    "fastify": "^5.12.7",
+    "ioredis": "^6.0.0",
+    "mppx": "^0.13.6",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "poseidon-lite": "^0.3.0",
+    "snarkjs": "^0.7.6",
+    "viem": "^2.57.7",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "circom2": "^0.2.23",
+    "circomlib": "^2.0.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}

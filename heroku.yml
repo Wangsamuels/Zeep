@@ -1,0 +1,20 @@
+# One app per network (zeep-api-test, zeep-api-main); same code, different config vars.
+setup:
+  addons:
+    - plan: heroku-postgresql
+    - plan: heroku-redis
+build:
+  docker:
+    web: Dockerfile.node
+    treasury: Dockerfile.node
+    watcher: Dockerfile.rust
+    payouts: Dockerfile.rust
+release:
+  image: web
+  command:
+    - node dist/migrate.js
+run:
+  web: node dist/server.js
+  treasury: node dist/workers/treasury.js
+  watcher: /app/bin/zeep-watcher
+  payouts: /app/bin/zeep-payouts

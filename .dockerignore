@@ -1,0 +1,7 @@
+node_modules
+dist
+rust/target
+circuits
+scratch
+.env*
+.git

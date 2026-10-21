@@ -1,0 +1,38 @@
+# VPS relay: the only thing that ever sees client IPs. Heroku sees only this box.
+# Replace RELAY_SHARED_SECRET via `caddy run --envfile /etc/zeep/relay.env`.
+{
+	# No access logs anywhere: client IPs must not be stored.
+	log default {
+		output discard
+	}
+}
+
+api.zeep.app {
+	reverse_proxy https://zeep-api-main.herokuapp.com {
+		header_up Host zeep-api-main.herokuapp.com
+		header_up X-Zeep-Relay {env.RELAY_SHARED_SECRET}
+		header_up -X-Forwarded-For
+		header_up -X-Real-IP
+		header_up -Forwarded
+		header_up -Via
+		flush_interval -1          # stream SSE immediately
+		transport http {
+			read_timeout 10m
+		}
+	}
+}
+
+api-test.zeep.app {
+	reverse_proxy https://zeep-api-test.herokuapp.com {
+		header_up Host zeep-api-test.herokuapp.com
+		header_up X-Zeep-Relay {env.RELAY_SHARED_SECRET_TEST}
+		header_up -X-Forwarded-For
+		header_up -X-Real-IP
+		header_up -Forwarded
+		header_up -Via
+		flush_interval -1
+		transport http {
+			read_timeout 10m
+		}
+	}
+}

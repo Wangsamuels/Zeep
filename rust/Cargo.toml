@@ -1,0 +1,38 @@
+[package]
+name = "zeep-chain"
+version = "0.1.0"
+edition = "2021"
+description = "Zeep Zcash workers: payment watcher and refund/sweep payouts"
+publish = false
+
+[[bin]]
+name = "zeep-watcher"
+path = "src/bin/zeep-watcher.rs"
+
+[[bin]]
+name = "zeep-payouts"
+path = "src/bin/zeep-payouts.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+hex = "0.4"
+num-bigint = "0.4"
+rand = "0.8"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure", "script"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

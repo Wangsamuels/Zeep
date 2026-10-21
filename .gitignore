@@ -1,0 +1,14 @@
+node_modules/
+dist/
+rust/target/
+circuits/*.r1cs
+scratch/
+.env
+.env.*
+!.env.example
+circuits/*.ptau
+circuits/zeep_spend_js/
+
+# local Redis snapshots
+*.rdb
+.DS_Store
