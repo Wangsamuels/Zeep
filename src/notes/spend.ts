@@ -14,6 +14,7 @@ import { tx, type Tx } from '../lib/db.js';
 import { errors, ZeepError } from '../lib/errors.js';
 import { hashToField, sha256hex, toField } from '../lib/field.js';
 import { addBooks, type BookKind } from '../services/books.js';
+import { marginOf } from '../services/fees.js';
 import { registry, type Appended, type Leaf } from './registry.js';
 
 const field = z.union([z.string(), z.number()]).transform((v, ctx) => {
@@ -70,12 +71,14 @@ export function bundleFromHeaders(headers: Record<string, string | string[] | un
 }
 
 // ---------- signals (clients must compute exactly the same) ----------
-export const requestSignal = (method: string, path: string, rawBody: Buffer | string | undefined) =>
-  hashToField('zeep-req-v1', method.toUpperCase(), path, sha256hex(rawBody ?? ''));
+/** Binds the request (method, path, exact body) and where a refund would go (compensate.d, or 0). */
+export const requestSignal = (method: string, path: string, rawBody: Buffer | string | undefined, refundD: bigint = 0n) =>
+  hashToField('zeep-req-v2', method.toUpperCase(), path, sha256hex(rawBody ?? ''), refundD.toString());
 export const withdrawSignal = (id: string, address: string) => hashToField('zeep-withdraw-v1', id.toLowerCase(), address);
 export const notesSignal = () => hashToField('zeep-notes-v1');
 export const depositSignal = (intentId: string, d: bigint) => hashToField('zeep-deposit-v1', intentId, d.toString());
-export const convertSignal = (id: string, mintD: bigint) => hashToField('zeep-convert-v1', id, mintD.toString());
+export const convertSignal = (id: string, mintD: bigint, amountMicroUsd: bigint) =>
+  hashToField('zeep-convert-v2', id, mintD.toString(), amountMicroUsd.toString());
 export const gateSignal = (method: string, requestDigestHex: string) => hashToField('zeep-gate-v1', method, requestDigestHex);
 
 // ---------- verifying key ----------
@@ -139,7 +142,7 @@ async function verify(o: SpendOpts): Promise<SpendBundle> {
     if (b.cost < BigInt(o.minCost)) throw new ZeepError(402, 'underpaid', `this request costs ${o.minCost} micro-USD`, { min_cost_micro_usd: o.minCost });
     if (b.cost > BigInt(o.minCost) * 2n + 1000n) throw errors.invalid('cost is far above the current price; refresh prices');
   }
-  for (const r of b.root) if (registry.treeOf(r.toString()) === undefined) throw errors.staleRoot();
+  for (const r of b.root) if ((await registry.acceptRoot(r.toString())) === undefined) throw errors.staleRoot();
   if (o.daily) {
     const today = BigInt(Math.floor(Date.now() / 86_400_000));
     const grace = BigInt(Math.floor((Date.now() - 120_000) / 86_400_000)); // proofs made just before midnight
@@ -194,6 +197,8 @@ export async function spendAll(
       for (const [i, o] of list.entries()) {
         const b = bundles[i];
         if (o.book && b.cost > 0n) await addBooks(c, o.book, b.cost);
+        // The markup on a service charge is booked in the same transaction (never lost to a crash).
+        if (o.book === 'service' && b.cost > 0n) await addBooks(c, 'margin', marginOf(b.cost));
         if (o.daily) {
           const t = await c.query('INSERT INTO daily_tags (day, purpose, tag) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
             [Number(b.tag.epoch), o.daily, b.tag.value.toString()]);
@@ -234,7 +239,10 @@ export async function spendAll(
             const a = await registry.appendInTx(c, [{ commitment: leaf, enc: b.compensate!.e }]);
             pub = a.publish;
             res = a.result;
-            if (book === 'service') await addBooks(c, 'compensation', b.cost);
+            if (book === 'service') {
+              await addBooks(c, 'compensation', b.cost);
+              await addBooks(c, 'margin', -marginOf(b.cost)); // refunded: no margin earned
+            }
           });
         } catch (e) {
           await registry.resync();

@@ -17,17 +17,26 @@ export function newRedis(): Redis {
 /** Shared command connection. Subscribers must use their own (`newRedis()`). */
 export const redis = newRedis();
 
+/** Every key is namespaced by network, so a testnet and a mainnet app can never share state. */
+export const NS = `zeep:${cfg.ZEEP_ENV}`;
 export const keys = {
-  roots: (series: number) => `zeep:roots:${series}`,
-  rootsPattern: 'zeep:roots:*',
-  tag: (series: number, epoch: string, tag: string) => `zeep:tag:${series}:${epoch}:${tag}`,
-  lock: (name: string) => `zeep:lock:${name}`,
-  mppBudget: (day: string) => `zeep:mpp:budget:${day}`,
-  cfg: 'zeep:cfg',
-  reserve: 'zeep:reserve',
-  chainHeight: 'zeep:chain:height',
-  job: (id: string) => `zeep:job:${id}`,
+  lock: (name: string) => `${NS}:lock:${name}`,
+  mppBudget: (day: string) => `${NS}:mpp:budget:${day}`,
+  reserve: `${NS}:reserve`,
+  chainHeight: `${NS}:chain:height`,
+  job: (id: string) => `${NS}:job:${id}`,
+  price: `${NS}:price:zec`,
+  notesChannel: `${NS}:notes`,
+  queuePrefix: `${NS}:q`,
+  network: 'zeep:network',
 };
+
+/** Refuse to run against a Redis that another network already uses. */
+export async function checkRedisNetwork(): Promise<void> {
+  await redis.set(keys.network, cfg.ZEEP_ENV, 'NX');
+  const got = await redis.get(keys.network);
+  if (got !== cfg.ZEEP_ENV) throw new Error(`This Redis belongs to ${got}; refusing to run ${cfg.ZEEP_ENV} on it. Use a separate Redis per network.`);
+}
 
 /**
  * Single-holder lock with a 60 s lease. `run` keeps renewing while `fn` runs and

@@ -18,6 +18,8 @@ pub struct RpcChain {
     reserve_ua: String,
     account: u32,
     privacy_policy: String,
+    min_confirmations: u32,
+    mainnet: bool,
 }
 
 impl RpcChain {
@@ -30,6 +32,8 @@ impl RpcChain {
             reserve_ua: cfg.reserve_ua.clone(),
             account: cfg.wallet_account,
             privacy_policy: cfg.wallet_privacy_policy.clone(),
+            min_confirmations: cfg.min_confirmations.max(1),
+            mainnet: cfg.zeep_env == "mainnet",
         })
     }
 
@@ -79,6 +83,27 @@ fn shielded(v: &Value) -> i64 {
 
 #[async_trait]
 impl Chain for RpcChain {
+    async fn check_network(&mut self, network: &str) -> Result<()> {
+        // zcashd/Zallet report "main", "test" or "regtest".
+        match self.call("getblockchaininfo", json!([])).await {
+            Ok(v) => {
+                let chain = v["chain"].as_str().unwrap_or_default();
+                if chain != network {
+                    bail!("the wallet node is on {chain}net but ZCASH_NETWORK={network}; refusing to run");
+                }
+                Ok(())
+            }
+            // On mainnet, refuse to run without knowing (override only after checking by hand).
+            Err(e) if self.mainnet && std::env::var("ALLOW_UNVERIFIED_NODE_NETWORK").as_deref() != Ok("1") => {
+                bail!("could not read the wallet node's network (getblockchaininfo: {e}); set ALLOW_UNVERIFIED_NODE_NETWORK=1 only after checking it is on mainnet")
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "could not read the node's network (getblockchaininfo); check it by hand");
+                Ok(())
+            }
+        }
+    }
+
     async fn tip_height(&mut self) -> Result<u32> {
         Ok(self.call("getblockcount", json!([])).await?.as_u64().ok_or_else(|| anyhow!("bad height"))? as u32)
     }
@@ -113,7 +138,9 @@ impl Chain for RpcChain {
 
     async fn balance(&mut self) -> Result<Balance> {
         let total = self.call("z_getbalanceforaccount", json!([self.account, 0])).await?;
-        let spendable = self.call("z_getbalanceforaccount", json!([self.account, 1])).await?;
+        // Spendable only at MIN_CONFIRMATIONS, the same depth at which deposits are credited, so
+        // the float can never convert a deposit before it is counted as owed.
+        let spendable = self.call("z_getbalanceforaccount", json!([self.account, self.min_confirmations])).await?;
         Ok(Balance {
             total_zats: shielded(&total) + pool(&total, "transparent"),
             spendable_zats: shielded(&spendable),
@@ -139,10 +166,17 @@ impl Chain for RpcChain {
         // Transparent recipients (NEAR Intents deposit addresses, opted-in user payouts)
         // need a policy that allows revealing the recipient.
         let policy = if to.starts_with('t') { "AllowRevealedRecipients" } else { self.privacy_policy.as_str() };
-        let opid = self
-            .call("z_sendmany", json!([self.reserve_ua, [{"address": to, "amount": zats_to_zec(amount_zats)}], 1, null, policy]))
-            .await
-            .map_err(|e| SendError::NotBroadcast(e.to_string()))?;
+        let params = |p: &str| json!([self.reserve_ua, [{"address": to, "amount": zats_to_zec(amount_zats)}], 1, null, p]);
+        let opid = match self.call("z_sendmany", params(policy)).await {
+            Ok(v) => v,
+            // The wallet refuses FullPrivacy when the send must reveal amounts (crossing pools,
+            // e.g. a Sapling-only recipient). Nothing was sent, so retry with the next policy.
+            Err(e) if policy == "FullPrivacy" && e.to_string().to_lowercase().contains("privacy") => self
+                .call("z_sendmany", params("AllowRevealedAmounts"))
+                .await
+                .map_err(|e| SendError::NotBroadcast(e.to_string()))?,
+            Err(e) => return Err(SendError::NotBroadcast(e.to_string())),
+        };
         let opid = opid.as_str().ok_or_else(|| SendError::NotBroadcast("no operation id".into()))?.to_string();
         self.wait_op(&opid).await
     }

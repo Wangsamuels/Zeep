@@ -3,6 +3,7 @@
 // always arriving shielded) and note management (merge / split / fund an agent).
 // Fees: see src/services/fees.ts. "First of the user's day" is enforced with a private daily
 // tag in the proof, so it works without accounts or linking.
+import { createHash } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { cfg } from '../config.js';
@@ -10,11 +11,10 @@ import { encryptAddr } from '../lib/crypto.js';
 import { q, tx } from '../lib/db.js';
 import { errors, ZeepError } from '../lib/errors.js';
 import { toField } from '../lib/field.js';
-import { keys, redis } from '../lib/redis.js';
 import { bundleFromHeaders, convertSignal, depositSignal, mintedLeaf, notesHeader, notesSignal, parseBundle, spend, spendAll, USD, withdrawSignal, ZEC, type SpendOpts } from '../notes/spend.js';
 import { addBooks } from '../services/books.js';
 import { bpsOf, feeSheet, takeSubsidy } from '../services/fees.js';
-import { microUsdToZats, zatsToMicroUsd, zecQuotes } from '../services/prices.js';
+import { microUsdToZats, moneyQuote, zatsToMicroUsd } from '../services/prices.js';
 import { scheduleTranches } from '../treasury/float.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -103,7 +103,24 @@ export default async function moneyRoutes(app: FastifyInstance) {
     expected_zats: z.number().int().positive().max(21e14).optional(),
     claim_from: z.string().regex(INTENT).optional(), // move unclaimed funds from an older intent
     proof: z.unknown().optional(), // daily tag proof (purpose 2): first deposit today gets its fee back
+    pow: z.string().regex(/^[0-9a-f]{1,32}$/).optional(), // anti-spam: see powOk()
   });
+
+  /** sha256("zeep-intent-pow-v1:" + intent_id + ":" + nonce) must start with INTENT_POW_BITS zero bits (~1 s in a browser at 16). */
+  const powOk = (id: string, nonce: string | undefined) => {
+    if (cfg.INTENT_POW_BITS <= 0) return true;
+    if (!nonce) return false;
+    const h = createHash('sha256').update(`zeep-intent-pow-v1:${id}:${nonce}`).digest();
+    let bits = cfg.INTENT_POW_BITS;
+    for (const byte of h) {
+      if (bits <= 0) return true;
+      if (bits >= 8) {
+        if (byte !== 0) return false;
+        bits -= 8;
+      } else return (byte >> (8 - bits)) === 0;
+    }
+    return true;
+  };
 
   /** Reserve a fresh deposit address for one note. Idempotent on intent_id. */
   app.post('/v1/deposits', async (req, reply) => {
@@ -121,6 +138,13 @@ export default async function moneyRoutes(app: FastifyInstance) {
     const id = b.data.intent_id;
     const existing = await intentStatus(id);
     if (existing) return existing;
+    if (!powOk(id, b.data.pow)) throw errors.bad('missing or insufficient proof of work (pow)');
+    const [open] = await q<{ n: string }>(`SELECT count(*) AS n FROM deposit_intents WHERE status = 'open' AND expires_at > now()`);
+    if (Number(open.n) >= cfg.MAX_OPEN_INTENTS) throw new ZeepError(503, 'busy', 'too many deposits are waiting right now; try again in a few minutes');
+    // Check an address is free before revealing today's tag, so a 503 never costs the rebate.
+    if (!(await q('SELECT 1 FROM deposit_addresses WHERE intent_id IS NULL LIMIT 1')).length) {
+      throw new ZeepError(503, 'no_address', 'no deposit address is ready yet; try again in a minute');
+    }
 
     let firstToday = false;
     if (b.data.proof !== undefined) {
@@ -141,12 +165,14 @@ export default async function moneyRoutes(app: FastifyInstance) {
          VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(hours => $7))`,
         [id, d.toString(), dZec.toString(), a.rows[0].address, b.data.expected_zats ?? null, firstToday, cfg.DEPOSIT_INTENT_TTL_HOURS]);
       if (b.data.claim_from) {
-        const moved = await c.query(
-          `UPDATE deposits SET status = 'claimed', claimed_by = $2 WHERE intent_id = $1 AND status = 'unclaimed' RETURNING amount_zats, txid_hash, block_height`,
+        // All unclaimed payments of the old intent become ONE deposit of the new one.
+        const moved = await c.query<{ amount_zats: string; block_height: number }>(
+          `UPDATE deposits SET status = 'claimed', claimed_by = $2 WHERE intent_id = $1 AND status = 'unclaimed' RETURNING amount_zats, block_height`,
           [b.data.claim_from, id]);
-        for (const m of moved.rows) {
+        if (moved.rows.length) {
+          const total = moved.rows.reduce((s, m) => s + BigInt(m.amount_zats), 0n);
           await c.query(`INSERT INTO deposits (txid_hash, intent_id, amount_zats, block_height, status) VALUES ($1, $2, $3, $4, 'confirmed')`,
-            [`claim:${m.txid_hash}`, id, m.amount_zats, m.block_height]);
+            [`claim:${id}`, id, total.toString(), Math.max(...moved.rows.map((m) => m.block_height))]);
         }
       }
     });
@@ -154,9 +180,11 @@ export default async function moneyRoutes(app: FastifyInstance) {
     return intentStatus(id);
   });
 
-  app.get<{ Params: { id: string } }>('/v1/deposits/:id', async (req) => {
-    if (!INTENT.test(req.params.id)) throw errors.notFound();
-    const s = await intentStatus(req.params.id);
+  // POST, not GET: the intent id is a bearer secret and must not appear in URL paths (router logs).
+  app.post('/v1/deposits/status', async (req) => {
+    const id = (req.body as { intent_id?: unknown } | undefined)?.intent_id;
+    if (typeof id !== 'string' || !INTENT.test(id)) throw errors.notFound();
+    const s = await intentStatus(id);
     if (!s) throw errors.notFound('deposit not found');
     return s;
   });
@@ -190,7 +218,7 @@ export default async function moneyRoutes(app: FastifyInstance) {
     }
     const bundle = parseBundle(b.data.proof);
     if (bundle.cost < BigInt(cfg.MIN_CONVERT_ZATS)) throw errors.bad(`conversions must be at least ${cfg.MIN_CONVERT_ZATS} zats`);
-    const px = (await zecQuotes()).current.usd;
+    const px = (await moneyQuote()).usd;
     const value = zatsToMicroUsd(Number(bundle.cost), px);
     const max = value - bpsOf(value, cfg.DEPOSIT_FEE_BPS);
     const amount = b.data.mint.amount_micro_usd;
@@ -199,14 +227,14 @@ export default async function moneyRoutes(app: FastifyInstance) {
     }
     const fee = value - amount; // the conversion fee, plus any quote slack the client left
     const { spent, minted } = await spendAll(
-      [{ bundle, asset: ZEC, signal: convertSignal(b.data.conversion_id.toLowerCase(), d), book: 'zec_to_usd' }],
+      // The signal binds the new note's owner AND amount, so nobody holding the proof can change either.
+      [{ bundle, asset: ZEC, signal: convertSignal(b.data.conversion_id.toLowerCase(), d, BigInt(amount)), book: 'zec_to_usd' }],
       async (c) => {
         await addBooks(c, 'usd_from_zec', amount);
         await addBooks(c, 'conversion_fee', fee);
         return [{ commitment: mintedLeaf(d, BigInt(amount), USD), enc: b.data.mint.e }];
       },
     );
-    await redis.del(keys.reserve);
     reply.header('x-zeep-notes', notesHeader(spent[0].notes));
     reply.code(201);
     return {
@@ -248,7 +276,8 @@ export default async function moneyRoutes(app: FastifyInstance) {
     const ub = b.data.usd_proof === undefined ? undefined : parseBundle(b.data.usd_proof);
     const zecZats = Number(zb?.cost ?? 0n);
     const usdMicro = Number(ub?.cost ?? 0n);
-    const px = (await zecQuotes()).current.usd;
+    if ((zb && zb.cost === 0n) || (ub && ub.cost === 0n)) throw errors.bad('each proof must withdraw a positive amount');
+    const px = (await moneyQuote()).usd;
     const total = zatsToMicroUsd(zecZats, px) + usdMicro;
     if (total < cfg.MIN_WITHDRAWAL_MICRO_USD) throw errors.bad(`withdrawals must be worth at least ${cfg.MIN_WITHDRAWAL_MICRO_USD} micro-USD`);
     if (ub && usdMicro < cfg.MIN_WITHDRAWAL_MICRO_USD) throw errors.bad(`the credits converted back must be at least ${cfg.MIN_WITHDRAWAL_MICRO_USD} micro-USD`);
@@ -256,15 +285,21 @@ export default async function moneyRoutes(app: FastifyInstance) {
     const networkZats = 2 * cfg.REFUND_NETWORK_FEE_ZATS;
     const networkMicro = zatsToMicroUsd(networkZats, px);
 
-    // The first proof carries today's withdrawal tag; a second one uses a random tag.
+    // Exactly one proof carries today's withdrawal tag (the client puts it on the larger part).
+    // Covered network fees need that tagged proof itself to move at least FREE_FEE_MIN, so a
+    // throwaway key with a tiny proof can't claim them.
+    const zTagged = zb?.tag.purpose === 1;
+    if (!zTagged && ub?.tag.purpose !== 1) throw errors.invalid('one of the proofs needs today\'s withdrawal tag');
+    const taggedValue = zTagged ? zatsToMicroUsd(zecZats, px) : usdMicro;
     const signal = withdrawSignal(id, addr);
     const list: SpendOpts[] = [];
-    if (zb) list.push({ bundle: zb, asset: ZEC, signal, exactCost: zb.cost, book: 'zec_withdrawal', daily: 1 });
-    if (ub) list.push({ bundle: ub, asset: USD, signal, exactCost: ub.cost, book: 'withdrawal', daily: zb ? undefined : 1 });
+    if (zb) list.push({ bundle: zb, asset: ZEC, signal, exactCost: zb.cost, book: 'zec_withdrawal', daily: zTagged ? 1 : undefined });
+    if (ub) list.push({ bundle: ub, asset: USD, signal, exactCost: ub.cost, book: 'withdrawal', daily: zTagged ? undefined : 1 });
+    const taggedIndex = zTagged || !zb ? 0 : 1;
 
     let amt!: ReturnType<typeof withdrawalAmounts> & { zeepPays: boolean };
     const { spent } = await spendAll(list, async (c, meta) => {
-      const zeepPays = meta[0].firstToday && total >= cfg.FREE_FEE_MIN_MICRO_USD && (await takeSubsidy(c, networkMicro));
+      const zeepPays = meta[taggedIndex].firstToday && taggedValue >= cfg.FREE_FEE_MIN_MICRO_USD && (await takeSubsidy(c, networkMicro));
       amt = { ...withdrawalAmounts(zecZats, usdMicro, networkZats, zeepPays), zeepPays };
       if (!ub && amt.zecNow <= 0) throw errors.bad('amount is too small to cover the network fees');
       await c.query(
@@ -277,8 +312,6 @@ export default async function moneyRoutes(app: FastifyInstance) {
       // ZEC only: paid straight from the shielded reserve.
       if (!ub) await scheduleTranches(c, id, amt.zecNow, null);
     });
-    await redis.del(keys.reserve);
-
     const notes = { zec: zb ? spent[0].notes : null, usd: ub ? spent[zb ? 1 : 0].notes : null };
     reply.code(201);
     return {
@@ -298,9 +331,11 @@ export default async function moneyRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get<{ Params: { id: string } }>('/v1/withdrawals/:id', async (req) => {
-    if (!UUID.test(req.params.id)) throw errors.notFound();
-    const id = req.params.id.toLowerCase();
+  // POST with the id in the body, so withdrawal ids never land in router logs.
+  app.post('/v1/withdrawals/status', async (req) => {
+    const raw = (req.body as { withdrawal_id?: unknown } | undefined)?.withdrawal_id;
+    if (typeof raw !== 'string' || !UUID.test(raw)) throw errors.notFound();
+    const id = raw.toLowerCase();
     const [w] = await q<{
       status: string; zec_zats: string; gross_micro_usd: string; fee_micro_usd: string; network_fee_zats: string; network_fee_paid_by: string;
       transparent: boolean; zec_received: string | null;

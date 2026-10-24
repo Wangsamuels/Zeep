@@ -48,8 +48,8 @@ It does not store balances, IPs or request bodies.
 | --- | --- | --- |
 | `web` | `src/server.ts` | Public API, spend verification, service proxy, SSE streaming, deposit activator |
 | `treasury` | `src/workers/treasury.ts` | Converts ZEC not owed to ZEC notes into USDC.e, and credits back to ZEC for withdrawals (NEAR Intents + Relay); raises reserve alerts; applies retention rules |
-| `watcher` | `rust/src/bin/zeep-watcher.rs` | Keeps fresh deposit addresses ready and records payments to them |
-| `payouts` | `rust/src/bin/zeep-payouts.rs` | Sends withdrawal tranches and float conversions, and shields ZEC that comes back (one sender, Redis lease) |
+| `wallet` | `rust/src/bin/zeep-wallet.rs` | **The Zcash light client (`CHAIN_BACKEND=lightclient`):** syncs from lightwalletd (zec.rocks, with failover), keeps deposit addresses ready, records deposits, sends payouts and conversions, and shields returned ZEC. Exactly 1 dyno (Standard-2X); its state is saved in Postgres. |
+| `watcher` / `payouts` | `rust/src/bin/zeep-watcher.rs`, `zeep-payouts.rs` | The same two jobs as separate processes, for `CHAIN_BACKEND=rpc` (Zallet on a VPS) or `dev` (simulated chain, tests) |
 | `release` | `src/migrate.ts` | Migrations; opens the first note tree |
 
 ```
@@ -113,6 +113,64 @@ The reserve holds each asset against its own notes, so neither side depends on Z
 - NEAR Intents only accepts **transparent** Zcash addresses, so ZEC goes out to, and comes back at, t-addresses. The payouts worker shields what comes back.
 - `TREASURY_RAILS=live` runs real conversions; `mock` is for tests and testnet.
 
+## Testnet and mainnet never mix
+
+Run each network as its **own Heroku app with its own Postgres and Redis**. Every process checks this at boot and refuses to start otherwise:
+
+- **Config.**
+  - `ZEEP_ENV` and `ZCASH_NETWORK` must match (`testnet`/`test`, `mainnet`/`main`).
+  - `ZEEP_RECEIVE_UA`, `ZEEP_RESERVE_UA`, `ZEEP_RESERVE_TADDR` and `TREASURY_REFUND_TO` must be addresses of that network.
+- **Mainnet** additionally needs:
+  - `TREASURY_RAILS=live` and `MPP_MODE=live`;
+  - a pinned `SPEND_VKEY_SHA256`;
+  - a live ZEC price (no fallback);
+  - `REQUIRE_RELAY=true`.
+- **Testnet** can never move real money:
+  - the rails are always simulated;
+  - live paid services need `TESTNET_LIVE_MPP=true`.
+- **Database.** The first migrate stamps it with its network. The web, treasury, wallet, watcher and payouts processes all refuse a database stamped for the other network.
+- **Redis.** Every key, lock, queue and channel is prefixed `zeep:<network>:`, and the Redis is stamped with its network too.
+- **Zcash server.** The light client asks each lightwalletd server which chain it serves and refuses one on the other network. It also refuses a `ZEEP_RESERVE_TADDR` that doesn't belong to its seed, so NEAR Intents can't send ZEC to the wrong place. With Zallet (`rpc`), the workers check `getblockchaininfo` and fail closed on mainnet unless `ALLOW_UNVERIFIED_NODE_NETWORK=1`.
+- **User keys.** The SDK derives every key with the network in it, so one recovery phrase gives unrelated keys, vault ids and deposit ids on testnet and mainnet. The client refuses to talk to a server on the other network before sending anything key-derived.
+
+## Safety rules in the money path
+
+- **Prices.** Money moves only at a live price no older than `PRICE_MAX_AGE_SEC`, and never at the fallback price on mainnet. Without one, deposits wait and refills/withdrawals return 503 `price_unavailable`.
+- **Deposits.**
+  - One intent becomes exactly one ZEC note + one dollar note. A second payment to the same address is held and claimed as one combined deposit.
+  - ZEC still confirming counts as owed, so the float never converts it. The reserve wallet's spendable balance is read at `MIN_CONFIRMATIONS`.
+- **Refunds.** A failed request is refunded as a new note, except when Zeep already paid the upstream (an MPP payment was signed). The service margin is booked in the same transaction and reversed on a refund.
+- **Treasury conversions** record each step before moving money.
+  - If a step is interrupted while money may already have moved, the conversion is marked `failed` and raised as an `ALERT` for a manual check. It is never retried blindly.
+  - Withdrawals converting credits wait in `converting` until someone resolves it.
+  - Housekeeping never touches a withdrawal that is still converting.
+- **Payouts.** One bad lookup doesn't block the others. An RPC outage doesn't count as "unconfirmed". A payout still unconfirmed after 2 hours becomes `stuck` and is checked again later.
+
+**Operations: what an ALERT means.**
+
+| Log line | What to do |
+| --- | --- |
+| `conversion interrupted mid-payment` / `bridge back delivered too little` | Check the EVM wallet, Relay and 1Click for that conversion; finish or refund it by hand. Then set the conversion `done` and schedule the withdrawal's tranches (or refund the user). |
+| `withdrawal conversion refunded` | 1Click refunded the swap: the USDC is back on Base. Re-run the swap by hand for that withdrawal. |
+| `payouts stuck` / `payout unconfirmed after 2 hours` | Look the txid up in the wallet. If it never broadcast, set the payout back to `scheduled`. |
+| `reserve below coverage floor` | Compare `/v1/reserve` with the wallet and the float before anything else. |
+
+## Privacy rules
+
+- **Spent-note checks** go by bucket (`/v1/nullifiers/buckets`). Clients never send their exact nullifiers.
+- **Bearer ids stay out of URLs.** Deposit intent ids, withdrawal ids and the vault id travel in request bodies or headers, never in URL paths, which Heroku's router logs.
+- **`/v1/reserve`** is published hourly and rounded to $1 and 0.01 ZEC.
+- **Stored timestamps and hashes.** Notes and nullifiers keep only the day. Deposit hashes are salted with a per-database secret.
+- **Payouts on-chain.** They try `FullPrivacy` first and fall back to revealing amounts only when a send must cross pools. Tranches are split around 50% with ±10% jitter.
+
+## Known limits before mainnet
+
+- **Deposit spam.** Each deposit intent takes an address. The light client scans every block once for the whole account, so watched addresses cost nothing extra. The `MAX_OPEN_INTENTS` cap still lets a determined attacker block new deposits for a day; the proof of work (`INTENT_POW_BITS`) makes that cost them CPU. With the Zallet backend, each watched address also costs one RPC call per tick.
+- **Late payments.** An address is watched until 7 days after its intent expires. Later payments aren't credited automatically: they show up as surplus ZEC (refund by hand).
+- **Restore links deposits.** Restoring asks for each deposit slot's status, which shows the server those deposits belong together (as creating them did).
+- **Free tags.** The daily free tag is per key. Someone who spreads money over fresh keys can claim more than one covered fee a day; the profit floor caps the total.
+- **Migrations.** `001_init.sql` was edited in place because nothing is deployed yet. After the first deploy, every schema change goes in a new `00N_*.sql`.
+
 ## Run and test locally
 
 ```bash
@@ -122,8 +180,9 @@ npm run migrate:dev && npm run dev
 (cd rust && CHAIN_BACKEND=dev cargo run --bin zeep-watcher)
 (cd rust && CHAIN_BACKEND=dev PAYOUT_ADDR_ENC_KEY=... cargo run --bin zeep-payouts)
 
-npm test                    # 11 unit tests: real proofs, asset and tag forgeries failing, fees, float
-npm run test:e2e            # 8 end-to-end tests with the Rust workers on the dev chain + mock rails
+npm test                                        # 16 unit tests
+npm run test:e2e                                # 12 end-to-end tests, testnet settings
+ZEEP_E2E_NETWORK=mainnet npm run test:e2e       # the same 12 with mainnet settings (own DB zeep_mainnet_test, Redis db 1)
 (cd rust && cargo test)
 ```
 
@@ -138,13 +197,25 @@ The end-to-end tests run the SDK the same way the app will:
 7. check that ZEC held covers ZEC owed, dollars held cover dollars owed, and the fees leave a profit after real conversion costs;
 8. check that vault items expire after the 30-day auto-delete.
 
+They also cover these safety cases:
+
+- housekeeping never touches a converting withdrawal;
+- two payments to one address are credited once each, with no duplicate notes;
+- confirming deposits count as owed;
+- every process, Node and Rust, refuses a database, Redis or config from the other network.
+
+The mainnet run uses `u1`/`zs1`/`t1` addresses, the mainnet model list and no testnet caps. Only the chain and rails are simulated: `ZEEP_TEST_SIMULATION=1`, which works only with `NODE_ENV=test` and never on Heroku.
+
 ## Before mainnet
 
 - **Trusted setup.** `npm run circuits` without `PTAU=` creates an **insecure dev setup**. For mainnet:
   - use the public Hermez/PSE `powersOfTau28_hez_final_14.ptau`;
   - run a phase-2 ceremony with several independent contributors;
   - publish the transcript and pin `SPEND_VKEY_SHA256`.
-- **Chain backend.** `CHAIN_BACKEND=rpc` (Zallet on the VPS) and `dev` work. The in-dyno light client is still a trait to implement once an Ironwood-capable librustzcash is available.
+- **Chain backend.** `lightclient` (recommended, no VPS), `rpc` (Zallet) and `dev` all work.
+  - The light client is built on `zcash_client_backend` 0.25 and `zcash_client_sqlite` 0.23, which are Ironwood-ready. It receives in Sapling, Orchard and Ironwood, and sends change into Ironwood from NU6.3 on.
+  - **Tested live on testnet** against zec.rocks: wallet creation, failover, sync, deposit addresses, saving and restoring through Postgres, and network/address checks.
+  - **Not yet tested with real funds:** receiving a deposit, a payout send and shielding. These need testnet ZEC; do them first after deploying (docs/DEPLOY.md §9).
 - **Provider paths.** StableEmail, RxAtlas, TrialBase, Parallel and the RPC URL templates are best guesses. Confirm them during your day-1 endpoint checks (`PROVIDERS` in `src/routes/services.ts`).
 - **Fee levels.** The 1.5% deposit and withdrawal fees assume each conversion costs about 1%. Watch `profit.conversion_costs_micro_usd` against `profit.conversion_fees_micro_usd` in `/v1/reserve` during testnet. If real slippage runs higher (the cap is `TREASURY_SLIPPAGE_BPS`, 1%), raise the fees.
 - **Credit-to-conversion gap.** A deposit's dollar half (and a refill) is credited at the price when it confirms and converted a minute or so later. The fee absorbs small moves in between.

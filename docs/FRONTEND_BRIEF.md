@@ -27,9 +27,56 @@ Delete or replace everything built around plans, slots and RLN:
 
 - Change the recovery phrase to **24 words** (`NEXT_PUBLIC_RECOVERY_WORDS=24`), which WebZjs expects. Keep the existing PIN, Argon2id and passkey wrapping, and store the phrase itself encrypted in the vault record. Signing a Zcash transaction needs it.
 - From the phrase:
-  - `seedFromPhrase(phrase)` → `deriveKeys(seed)` gives the Zeep spend key, the note-backup key, the vault id, auth and key, and the deposit-intent key.
+  - `seedFromPhrase(phrase)` → `deriveKeys(seed, network)` gives the Zeep spend key, the note-backup key, the vault id, auth and key, and the deposit-intent key. `network` is `"testnet"` or `"mainnet"`: **set it in the app build per deployment** (`NEXT_PUBLIC_ZEEP_NETWORK`), never from user input. The same phrase gives unrelated keys on each network. `ZeepClient` checks `/v1/config` and refuses a server on the other network before sending anything.
   - The **same phrase** creates the in-app Zcash wallet (WebZjs account 0).
   - Restoring on a new device means entering the 24 words. That one step restores the wallet, the balance (`client.restore()`) and the chat history (vault).
+
+## 2b. Sign out, and sign in with the 24 words
+
+Users can sign out, and sign in to the same or another account with its 24 words. One account is open on a device at a time.
+
+**Sign out** (Settings → Account → "Sign out", shown only while unlocked):
+
+1. Open a warning dialog (Radix AlertDialog):
+   - Title: "Have you saved your 24-word recovery phrase?"
+   - Body: "Signing out removes this account from this device. The only way back in is your 24 words. Zeep can't recover them for you, and without them your balance and wallet are lost for good."
+   - If chat sync is off: "Your chats are stored only on this device and will be deleted. Turn on 'Sync chats across devices' first to keep them."
+   - Always, if there are any: "Your images and files (N) are stored only on this device and will be deleted. Download any you want to keep." Add a **Download all** button that saves them as one .zip.
+   - If a withdrawal is still `converting` or `paying`, or a deposit is `confirming`: "You have a payment in progress. It will finish, and you'll see it after signing back in."
+   - A **"Show my phrase"** button that asks for the PIN or passkey, then shows the words.
+   - A required checkbox: "I've written down my 24 words."
+   - **Sign out** (disabled until the box is ticked) and **Cancel**.
+2. On confirm, clear this account from the device:
+   - drop the keys and the `ZeepClient` from memory, and stop the proof and wallet workers;
+   - delete the IndexedDB data: the vault record (encrypted phrase, PIN/passkey wrapping), the note book, local chats, settings, and the WebZjs wallet database;
+   - remove the passkey link for this account;
+   - go to the welcome screen.
+   - Nothing is sent to the server, and nothing is deleted there: notes, deposit records and synced chats stay, encrypted, for the next sign-in.
+
+**Welcome screen (signed out)** has two choices:
+
+- **Create a new account**: the current onboarding (new 24 words → PIN/passkey → optional deposit).
+- **Sign in with 24 words**: one input with 24 word fields; paste should split them across the fields.
+  1. Validate with `seedFromPhrase` (checksum and wordlist). Show "Those words are not a valid recovery phrase" on failure.
+  2. Set a new PIN/passkey for this device.
+  3. Restore, with a progress screen:
+     - `client.restore(onProgress)` finds both balances (ZEC and dollars);
+     - `create_account("zeep", phrase, 0, birthday)` then `sync()` restores the in-app wallet;
+     - if sync was on, pull chats from the vault.
+  4. **Wallet birthday.** When an account is created, save the wallet's birthday height in the vault as item `wallet-meta` (`{ birthday }`), encrypted like chats. On sign-in, read it from the vault first so the wallet scan starts there and doesn't take long. If it's missing, use the Zcash Sapling activation height (the slowest option) and say "Restoring your wallet can take a few minutes".
+
+To switch accounts, the user signs out and signs in with the other account's 24 words.
+
+## 2c. Testnet and mainnet in the app
+
+- **One deployment per network.** Each build sets `NEXT_PUBLIC_ZEEP_NETWORK` and points at that network's API. Don't put a network switch in the UI.
+- **Namespace stored data.** Everything stored on the device goes under keys that include the network, e.g. `zeep:mainnet:notes`:
+  - the encrypted note book;
+  - chats and files;
+  - settings;
+  - the WebZjs wallet database (`new WebWallet("main" | "test", …)`).
+- **Keep the networks apart.** Testnet data must never load on mainnet: different keys, different notes, different wallet.
+- **Testnet banner.** Show a clear "Testnet: test ZEC only" banner on testnet.
 
 ## 3. In-app Zcash wallet (WebZjs)
 
@@ -64,7 +111,7 @@ Delete or replace everything built around plans, slots and RLN:
 ```ts
 import { deriveKeys, seedFromPhrase, NoteBook, ZeepClient, formatCredits, USD, ZEC } from "@/lib/zeep";
 
-const keys = deriveKeys(seedFromPhrase(phrase));
+const keys = deriveKeys(seedFromPhrase(phrase), process.env.NEXT_PUBLIC_ZEEP_NETWORK as "testnet" | "mainnet");
 const book = NoteBook.from(await loadEncrypted("notes"));        // IndexedDB, existing vault crypto
 const client = new ZeepClient({
   baseUrl: apiBase(network), keys, book, prove: workerProve,
@@ -160,6 +207,7 @@ The current `AiScreen.tsx` is a single column. Rebuild it as `components/chat/*`
 - Auto-growing textarea. Enter sends, Shift+Enter makes a new line.
 - **Paperclip button** with drag-and-drop and paste. It shows attachment chips (name, size, remove).
 - **Model picker** button to the left of Send. It shows the current model name **without a price**.
+- **Model label under each reply.** Below every AI reply, outside the message bubble, show a small muted line with the model that wrote it, for example "GPT-OSS 20B". Store the model id on each assistant message (`{ role, content, model }`) so the label stays right after the user switches models, and when old chats are reopened. Show no price here.
 - **Send** button with **no price on it**.
 
 **Model picker (the only place prices appear)**
@@ -170,11 +218,26 @@ The current `AiScreen.tsx` is a single column. Rebuild it as `components/chat/*`
 
 **Uploads**
 
-- **Images** (png, jpeg, webp, gif): send as OpenAI `image_url` parts with `data:` URLs. Allow them only when the selected model has `vision`; otherwise disable the image option with a hint.
+- **Images** (png, jpeg, webp, gif) can **always** be uploaded: from the paperclip, by drag-and-drop, by pasting a screenshot, and on phones from the camera or photo library (`<input type="file" accept="image/*" multiple>`).
+  - Show a thumbnail chip for each image, with a remove button.
+  - Send each image as an OpenAI `image_url` part with a `data:` URL. Downscale it in a canvas first, to 2048 px on the longest side, as JPEG or WebP.
+  - If the selected model can't read images (no `vision`), switch the picker to the cheapest model with `vision` (on testnet that's Qwen3 VL 30B), and show the toast "Switched to Qwen3 VL 30B to read your image". The user can switch back once the image is removed. Never send an image to a model without `vision`; the server rejects it with 400.
 - **Text and code** (txt, md, csv, json, js/ts/py and similar): read in the browser and send as a `text` part prefixed with `File: name`.
 - **PDF:** extract the text in the browser with `pdfjs-dist` (in its worker) and send it as a text part.
 - Total request body must be ≤ `prices.attachments.max_body_mb` (20 MB). Downscale large images in a canvas first.
 - Files never go anywhere except inside the paid request. Nothing is uploaded separately.
+
+**Images and files live on the user's device only**
+
+This covers everything the user attaches (images, PDFs, text, code) and everything the AI produces as a file: generated images, code blocks the user saves, exports, and similar.
+
+- **Storage.** Keep each file as its own encrypted record in IndexedDB: AES-GCM with `keys.vaultKey`, in an `attachments` store keyed by a random id. Store the original bytes plus a small encrypted thumbnail for images. Messages hold only a reference: `{ type: "file", id, name, mime, size }`.
+- **Never synced, never stored on the server.** Chat sync sends the message text and file references only, never file bytes or thumbnails. The server receives a file only inside the one paid request that needs it, and forwards it to the model without saving it.
+- **On another device**, or after signing back in, a reference whose file isn't on this device shows a placeholder: "Image (photo.jpg) is on another device".
+- **Sending again.** When a chat continues, the app re-reads earlier files from IndexedDB for the request, if they're still in the context it sends.
+- **Every file chip and AI-made file** has **Download** (and **Share** on phones, via the Web Share API) so the user can save it outside the app.
+- **Limits.** Call `navigator.storage.persist()` once after sign-in so the browser doesn't evict the files. Show storage used in Settings (`navigator.storage.estimate()`), with **Delete all files** and a per-chat delete.
+- **Deleting a chat** deletes its files. The 30-day auto-delete removes files with their chats. Sign-out deletes them all, after the warning in section 2b.
 - **Cost of a message:** `model.micro_usd + ceil(max(0, bodyBytes − 65536) / 1 MiB) × attachments.micro_usd_per_mb`. Pass this as the cost to `client.pay`.
 
 **Streaming**
@@ -187,14 +250,14 @@ The current `AiScreen.tsx` is a single column. Rebuild it as `components/chat/*`
 
 - Each chat is one object `{ id, title, model, createdAt, updatedAt, messages }`, encrypted with **AES-GCM using `keys.vaultKey`** and stored in IndexedDB. Titles come from the first user message, made on the device. No server call is used to generate titles.
 - **Optional sync** (settings toggle "Sync chats across devices", off by default):
-  - `PUT /v1/vault/{keys.vaultId}/items/chat-{id}` with header `x-vault-auth: keys.vaultAuth` and body `{ blob: base64(ciphertext), expires_at }`.
-  - On restore, pull them with `GET /v1/vault/{id}/items` and then `GET …/items/{item}`.
-  - The server only ever sees ciphertext.
+  - `PUT /v1/vault/items/chat-{id}` with headers `x-vault-id: keys.vaultId` and `x-vault-auth: keys.vaultAuth`, and body `{ blob: base64(ciphertext), expires_at }`. The vault id goes **only** in the header, never in the URL (router logs would link every request).
+  - On restore, pull them with `GET /v1/vault/items` and then `GET /v1/vault/items/{item}` (same two headers).
+  - The server only ever sees ciphertext, and never images or files (they stay on the device; see "Images and files" above).
 - **Settings panel** (gear in the sidebar):
   - **"Auto-delete chats after 30 days"** toggle (`NEXT_PUBLIC_CHAT_AUTODELETE_DEFAULT`). When it is on:
     - on load and every hour, delete local chats with `updatedAt < now − 30 days`;
     - set `expires_at = updatedAt + 30 days` on every synced item, which the server purges hourly and hides immediately once expired.
-  - "Delete all chats": clears IndexedDB and calls `DELETE /v1/vault/{id}`.
+  - "Delete all chats": clears IndexedDB and calls `DELETE /v1/vault` (same two headers).
   - "Sync across devices" toggle.
 - Locking the vault clears decrypted chats from memory.
 
@@ -203,7 +266,7 @@ The current `AiScreen.tsx` is a single column. Rebuild it as `components/chat/*`
 | File | Change |
 | --- | --- |
 | `next.config.ts` | Add `Cross-Origin-Opener-Policy: same-origin` (already there) **and `Cross-Origin-Embedder-Policy: require-corp`** for WebZjs threads. In the CSP: `connect-src` adds both API URLs and both lightwalletd gRPC-web URLs; `worker-src 'self' blob:`; `script-src 'self' 'wasm-unsafe-eval'`; `img-src 'self' data: blob:` (attachment previews). Add long-cache headers for `/circuits/*`. |
-| `.env.example` / `.env.local` / Vercel env | Add `NEXT_PUBLIC_AUTOSHIELD_MIN_ZATS=100000`, `NEXT_PUBLIC_SPEND_WASM_URL=/circuits/zeep_spend.wasm`, `NEXT_PUBLIC_SPEND_WASM_SHA256`, `NEXT_PUBLIC_SPEND_ZKEY_URL=/circuits/zeep_spend.zkey`, `NEXT_PUBLIC_SPEND_ZKEY_SHA256`, `NEXT_PUBLIC_LIGHTWALLETD_URL_TESTNET`, `NEXT_PUBLIC_LIGHTWALLETD_URL_MAINNET`, `NEXT_PUBLIC_RECOVERY_WORDS=24`, `NEXT_PUBLIC_MAX_UPLOAD_MB=20`, `NEXT_PUBLIC_CHAT_AUTODELETE_DEFAULT=false`, `NEXT_PUBLIC_CHAT_SYNC_DEFAULT=false`. Remove `NEXT_PUBLIC_RLN_*`, `NEXT_PUBLIC_PAY_ADDRESS_*` and `NEXT_PUBLIC_ACTIVATION_POLL_SEC`. |
+| `.env.example` / `.env.local` / Vercel env | Add `NEXT_PUBLIC_ZEEP_NETWORK=testnet` (or `mainnet`; one Vercel deployment per network), `NEXT_PUBLIC_AUTOSHIELD_MIN_ZATS=100000`, `NEXT_PUBLIC_SPEND_WASM_URL=/circuits/zeep_spend.wasm`, `NEXT_PUBLIC_SPEND_WASM_SHA256`, `NEXT_PUBLIC_SPEND_ZKEY_URL=/circuits/zeep_spend.zkey`, `NEXT_PUBLIC_SPEND_ZKEY_SHA256`, `NEXT_PUBLIC_LIGHTWALLETD_URL_TESTNET`, `NEXT_PUBLIC_LIGHTWALLETD_URL_MAINNET`, `NEXT_PUBLIC_RECOVERY_WORDS=24`, `NEXT_PUBLIC_MAX_UPLOAD_MB=20`, `NEXT_PUBLIC_CHAT_AUTODELETE_DEFAULT=false`, `NEXT_PUBLIC_CHAT_SYNC_DEFAULT=false`. Remove `NEXT_PUBLIC_RLN_*`, `NEXT_PUBLIC_PAY_ADDRESS_*` and `NEXT_PUBLIC_ACTIVATION_POLL_SEC`. |
 | `public/circuits/` | `zeep_spend.wasm` and `zeep_spend.zkey` from the backend's `npm run circuits`. Pin their hashes in the env vars above. **The circuit changed** (it now has an `asset` input), so replace any older copies. |
 | `public/webzjs/` (or the vendored package) | The WebZjs wallet build (`webzjs_wallet.js`, `.wasm`, `snippets/`). |
 | `package.json` | Add `snarkjs`, `poseidon-lite`, `pdfjs-dist`. Keep `@noble/hashes`, `@scure/bip39` and `idb`. Add the vendored WebZjs wallet. |
@@ -220,10 +283,12 @@ The current `AiScreen.tsx` is a single column. Rebuild it as `components/chat/*`
 | `GET /v1/series/:id/leaves`, `/tags` | `GET /v1/trees/:id/leaves?from=` (SDK handles it) |
 | `POST /v1/ai/chat` | `POST /v1/ai/chat/completions` (OpenAI format, `stream`, content parts) |
 | `POST /v1/refund` | `POST /v1/withdrawals` via `client.planWithdrawal(zats)` + `client.withdraw(plan, address, { allowTransparent })`: from the ZEC balance first (scheduled at once); beyond it, credits are converted back after the prompt (`converting`, 20–60 min). Paid as ZEC to a shielded or (opt-in) transparent address in two tranches 10 minutes apart |
-| `GET /v1/refund/:id` | `GET /v1/withdrawals/:id` |
+| `GET /v1/refund/:id` | `POST /v1/withdrawals/status` `{ withdrawal_id }` via `client.withdrawalStatus(id)` (ids stay out of URLs) |
 | `POST /v1/agents` | `POST /v1/notes/spend` with a transfer output to the agent's key (see `SpendPlan.transfer` in `sdk/spend.ts`) |
 | `POST /v1/inbox` (`{action}`) | `POST /v1/inbox` (empty body), `GET /v1/inbox/:inbox_id/messages` |
 | `GET /v1/chain` / `chain/call` | `POST /v1/rpc/:chain` (JSON-RPC) |
-| (new) | `GET /v1/prices`, `GET /v1/fees`, `POST /v1/deposits`, `GET /v1/deposits/:intent`, `POST /v1/convert/to-usd` (refills; the SDK calls it), `POST /v1/nullifiers/check`, `/v1/vault/*` |
+| (new) | `GET /v1/prices`, `GET /v1/fees`, `POST /v1/deposits` (the SDK adds the anti-spam `pow`), `POST /v1/deposits/status` `{ intent_id }`, `POST /v1/convert/to-usd` (refills; the SDK calls it), `POST /v1/nullifiers/buckets`, `/v1/vault/*` |
+
+**Never put an intent id, withdrawal id or vault id in a URL path or query string.** Always go through the SDK methods above.
 
 Every paid response carries `X-Zeep-Notes: tree:i0,i1` and `X-Zeep-Cost`. The SDK reads them.

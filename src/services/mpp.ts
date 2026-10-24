@@ -13,6 +13,8 @@ import { keys, redis } from '../lib/redis.js';
 
 const today = () => new Date().toISOString().slice(0, 10);
 const ctx = new AsyncLocalStorage<{ service: string; costUsd: number }>();
+/** Set by withCharge(): marks the user's request as paid upstream once an MPP credential is signed. */
+export const chargeCtx = new AsyncLocalStorage<{ upstreamPaid: boolean }>();
 
 class BudgetExceeded extends Error {}
 
@@ -41,7 +43,10 @@ function makeClient() {
       }
       const store = ctx.getStore();
       if (store) store.costUsd += usd;
-      return createCredential();
+      const credential = await createCredential();
+      const charge = chargeCtx.getStore();
+      if (charge && usd > 0) charge.upstreamPaid = true; // only once Zeep has actually signed a payment
+      return credential;
     },
   });
 }

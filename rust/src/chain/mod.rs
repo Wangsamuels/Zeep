@@ -4,17 +4,16 @@
 //! - `dev`: Postgres-backed simulation (`dev_incoming` / `dev_outgoing`), for local runs and CI.
 //! - `rpc`: a zcashd-compatible wallet JSON-RPC (Zallet) on the VPS. The spending key stays
 //!   on the VPS; Heroku holds only RPC credentials.
-//! - `lightclient`: the in-dyno design from the architecture doc (zcash_client_backend +
-//!   zcash_client_sqlite, wallet DB rebuilt from ZEEP_WALLET_BIRTHDAY_HEIGHT on boot, UFVK
-//!   for the watcher, seed for payouts). Not implemented yet: it must be written against the
-//!   Ironwood-capable librustzcash release (day-1 check #1). Implement `Chain` for it in
-//!   chain/lightclient.rs; nothing else changes.
+//! - `lightclient`: the reserve wallet inside the `zeep-wallet` dyno (zcash_client_backend +
+//!   zcash_client_sqlite, Ironwood-ready), reading blocks from lightwalletd (e.g. zec.rocks),
+//!   wallet state persisted in Postgres. See chain/lightclient.rs.
 
 pub mod dev;
+pub mod lightclient;
 pub mod rpc;
 
 use crate::config::{Backend, Config};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -65,15 +64,26 @@ pub trait Chain: Send {
     async fn send(&mut self, to: &str, amount_zats: i64) -> std::result::Result<String, SendError>;
     /// Confirmations of a transaction we sent; None if not (yet) known.
     async fn confirmations(&mut self, txid: &str) -> Result<Option<u32>>;
+    /// Make sure the node/wallet is on `network` ("main" / "test").
+    async fn check_network(&mut self, _network: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Catch up with the chain (light client); a no-op for node-backed wallets.
+    async fn sync(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Save local wallet state somewhere durable (light client); a no-op otherwise.
+    async fn persist(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub async fn connect(cfg: &Config, pool: sqlx::PgPool) -> Result<Box<dyn Chain>> {
-    match cfg.backend {
-        Backend::Dev => Ok(Box::new(dev::DevChain::new(pool, cfg))),
-        Backend::Rpc => Ok(Box::new(rpc::RpcChain::new(cfg)?)),
-        Backend::LightClient => bail!(
-            "CHAIN_BACKEND=lightclient is not built yet: implement chain::Chain with zcash_client_backend \
-             for the Ironwood release, or use CHAIN_BACKEND=rpc (Zallet on the VPS)"
-        ),
-    }
+    let mut chain: Box<dyn Chain> = match cfg.backend {
+        Backend::Dev => Box::new(dev::DevChain::new(pool, cfg)),
+        Backend::Rpc => Box::new(rpc::RpcChain::new(cfg)?),
+        Backend::LightClient => Box::new(lightclient::LightClient::connect(cfg, pool).await?),
+    };
+    chain.check_network(&cfg.network).await?;
+    Ok(chain)
 }

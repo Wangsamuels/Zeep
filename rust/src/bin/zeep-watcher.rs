@@ -7,30 +7,36 @@
 //!
 //! Users can deposit any amount from any wallet; no memo is needed.
 
-use anyhow::Result;
-use redis::AsyncCommands;
-use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tracing::{error, info};
-use zeep_chain::chain::{self, Chain};
+use zeep_chain::chain;
 use zeep_chain::config::Config;
-use zeep_chain::{init_tracing, lock, pg, sleep_or_shutdown};
+use zeep_chain::{check_network, init_tracing, lock, pg, sleep_or_shutdown};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let mut cfg = Config::from_env()?;
+    if cfg.backend == zeep_chain::config::Backend::LightClient {
+        anyhow::bail!("with CHAIN_BACKEND=lightclient run the single `wallet` process (zeep-wallet) instead");
+    }
     if cfg.poll_secs == 0 {
         cfg.poll_secs = 20;
     }
     let pool = pg(&cfg.database_url).await?;
     let mut redis = lock::connect(&cfg.redis_url).await?;
+    check_network(&cfg, &pool, &mut redis).await?;
+    // Permanent per-database salt (meta.txid_salt), so stored hashes can't be matched to public txids.
+    let hash_key: String = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'txid_salt'")
+        .fetch_optional(&pool)
+        .await?
+        .context("database has no txid_salt; run the release phase (migrate) first")?;
     let mut chain = chain::connect(&cfg, pool.clone()).await?;
     info!(backend = ?cfg.backend, network = %cfg.network, "watcher started");
 
     loop {
-        if let Err(e) = tick(&cfg, &pool, &mut redis, chain.as_mut()).await {
+        if let Err(e) = zeep_chain::watcher::tick(&cfg, &pool, &mut redis, chain.as_mut(), &hash_key).await {
             error!(err = %e, "watcher tick failed");
         }
         if sleep_or_shutdown(Duration::from_secs(cfg.poll_secs)).await {
@@ -41,83 +47,3 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn tick(cfg: &Config, pool: &PgPool, redis: &mut redis::aio::MultiplexedConnection, chain: &mut dyn Chain) -> Result<()> {
-    let tip = chain.tip_height().await?;
-    let _: () = redis.set("zeep:chain:height", tip).await?;
-    sqlx::query("UPDATE wallet_state SET chain_height = $1, scanned_height = $1, updated_at = now() WHERE id = 1")
-        .bind(tip as i32)
-        .execute(pool)
-        .await?;
-
-    top_up_addresses(cfg, pool, chain).await?;
-
-    // Addresses with an intent that is still waiting, or credited/expired recently
-    // (a late or second payment must still be seen and held for a claim).
-    let addrs: Vec<String> = sqlx::query_scalar(
-        "SELECT address FROM deposit_intents WHERE status = 'open' OR created_at > now() - interval '30 days'",
-    )
-    .fetch_all(pool)
-    .await?;
-    if addrs.is_empty() {
-        return Ok(());
-    }
-    let notes = chain.received(&addrs).await?;
-    let mut credited = 0;
-    for n in notes {
-        let txid_hash = hex::encode(Sha256::digest(format!("{}:{}", n.txid, n.index)));
-        let intent: Option<String> = sqlx::query_scalar("SELECT id FROM deposit_intents WHERE address = $1")
-            .bind(&n.to_address)
-            .fetch_optional(pool)
-            .await?;
-        let Some(intent) = intent else { continue };
-        if n.confirmations >= cfg.min_confirmations {
-            let r = sqlx::query(
-                "INSERT INTO deposits (txid_hash, intent_id, amount_zats, block_height) VALUES ($1,$2,$3,$4)
-                 ON CONFLICT (txid_hash) DO NOTHING",
-            )
-            .bind(&txid_hash)
-            .bind(&intent)
-            .bind(n.amount_zats)
-            .bind(n.height as i32)
-            .execute(pool)
-            .await?;
-            credited += r.rows_affected();
-        } else {
-            sqlx::query(
-                "INSERT INTO deposit_sightings (intent_id, txid_hash, amount_zats, confirmations) VALUES ($1,$2,$3,$4)
-                 ON CONFLICT (intent_id, txid_hash) DO UPDATE SET confirmations = $4, updated_at = now()",
-            )
-            .bind(&intent)
-            .bind(&txid_hash)
-            .bind(n.amount_zats)
-            .bind(n.confirmations as i32)
-            .execute(pool)
-            .await?;
-        }
-    }
-    if credited > 0 {
-        info!(deposits = credited, tip, "deposits confirmed");
-    }
-    Ok(())
-}
-
-/// Keep a pool of unused diversified addresses so a deposit intent never waits on the wallet.
-async fn top_up_addresses(cfg: &Config, pool: &PgPool, chain: &mut dyn Chain) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT (SELECT count(*) FROM deposit_addresses WHERE intent_id IS NULL) AS free,
-                (SELECT COALESCE(max(diversifier_index), -1) FROM deposit_addresses) AS last",
-    )
-    .fetch_one(pool)
-    .await?;
-    let free: i64 = row.get("free");
-    let first: i64 = row.get::<i64, _>("last") + 1;
-    for next in first..first + (cfg.address_pool_min - free).max(0) {
-        let address = chain.new_address(next as u64).await?;
-        sqlx::query("INSERT INTO deposit_addresses (diversifier_index, address) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(next)
-            .bind(&address)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
-}

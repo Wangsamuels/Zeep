@@ -24,9 +24,12 @@ export function randomField(): bigint {
 }
 
 /** Signal for a paid request: binds method, path and the exact body bytes. */
-export const requestSignal = (method: string, path: string, rawBody: string | Uint8Array) =>
-  hashToField("zeep-req-v1", method.toUpperCase(), path, sha256Hex(rawBody));
+/** Binds the request (method, path, exact body) and where a refund would go (its owner tag d, or 0). */
+export const requestSignal = (method: string, path: string, rawBody: string | Uint8Array, refundD: bigint = 0n) =>
+  hashToField("zeep-req-v2", method.toUpperCase(), path, sha256Hex(rawBody), refundD.toString());
 export const withdrawSignal = (id: string, address: string) => hashToField("zeep-withdraw-v1", id.toLowerCase(), address);
 export const notesSignal = () => hashToField("zeep-notes-v1");
 export const depositSignal = (intentId: string, d: bigint) => hashToField("zeep-deposit-v1", intentId, d.toString());
-export const convertSignal = (id: string, mintD: bigint) => hashToField("zeep-convert-v1", id.toLowerCase(), mintD.toString());
+/** Binds the conversion id and the new dollar note's owner tag and amount. */
+export const convertSignal = (id: string, mintD: bigint, amountMicroUsd: bigint) =>
+  hashToField("zeep-convert-v2", id.toLowerCase(), mintD.toString(), amountMicroUsd.toString());

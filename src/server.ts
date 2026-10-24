@@ -6,7 +6,8 @@ import { safeEqual } from './lib/crypto.js';
 import { pool } from './lib/db.js';
 import { ZeepError } from './lib/errors.js';
 import { log } from './lib/log.js';
-import { redis } from './lib/redis.js';
+import { checkRedisNetwork, redis } from './lib/redis.js';
+import { checkDbNetwork } from './migrate.js';
 import { registry } from './notes/registry.js';
 import { loadVkey } from './notes/spend.js';
 import aiRoutes from './routes/ai.js';
@@ -48,7 +49,7 @@ export async function buildApp() {
     if (cfg.REQUIRE_RELAY && !req.url.startsWith('/internal/')) {
       const relay = req.headers['x-zeep-relay'];
       if (typeof relay !== 'string' || !safeEqual(relay, cfg.RELAY_SHARED_SECRET)) {
-        return reply.code(403).send({ error: { code: 'relay_required', message: 'use https://api.zeep.app' } });
+        return reply.code(403).send({ error: { code: 'relay_required', message: `use ${cfg.PUBLIC_API_BASE_URL}` } });
       }
     }
     delete req.headers['x-zeep-relay'];
@@ -59,7 +60,7 @@ export async function buildApp() {
     credentials: false,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     exposedHeaders: ['x-zeep-notes', 'x-zeep-cost'],
-    allowedHeaders: ['content-type', 'x-zeep-proof', 'x-vault-auth', ...Array.from({ length: 15 }, (_, i) => `x-zeep-proof-${i + 1}`)],
+    allowedHeaders: ['content-type', 'x-zeep-proof', 'x-vault-id', 'x-vault-auth', ...Array.from({ length: 15 }, (_, i) => `x-zeep-proof-${i + 1}`)],
     maxAge: 600,
   });
 
@@ -93,6 +94,8 @@ export async function buildApp() {
 
 async function main() {
   if (isProd && cfg.REQUIRE_RELAY && !cfg.RELAY_SHARED_SECRET) throw new Error('REQUIRE_RELAY=true needs RELAY_SHARED_SECRET');
+  await checkDbNetwork();
+  await checkRedisNetwork();
   await registry.boot();
   await loadVkey().catch((e) => log.error({ err: e.message }, 'verifying key not loaded yet; paid routes will retry'));
   registry.startActivator();

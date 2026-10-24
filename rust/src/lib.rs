@@ -9,6 +9,8 @@ pub mod chain;
 pub mod config;
 pub mod crypto;
 pub mod lock;
+pub mod payouts;
+pub mod watcher;
 
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
@@ -21,6 +23,26 @@ pub async fn pg(url: &str) -> anyhow::Result<PgPool> {
         opts = opts.ssl_mode(PgSslMode::Require);
     }
     Ok(PgPoolOptions::new().max_connections(4).connect_with(opts).await?)
+}
+
+/// Refuse to run against a database or Redis that belongs to the other network.
+/// The Node release phase stamps the database (`meta.network`) when it migrates.
+pub async fn check_network(cfg: &config::Config, pool: &PgPool, redis: &mut redis::aio::MultiplexedConnection) -> anyhow::Result<()> {
+    let db: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'network'")
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("database not migrated ({e}); run the release phase first"))?;
+    match db {
+        Some(n) if n == cfg.zeep_env => {}
+        Some(n) => anyhow::bail!("this database belongs to {n}; refusing to run {} on it", cfg.zeep_env),
+        None => anyhow::bail!("database has no network stamp; run the release phase (migrate) first"),
+    }
+    let _: Option<String> = redis::cmd("SET").arg("zeep:network").arg(&cfg.zeep_env).arg("NX").query_async(redis).await?;
+    let r: Option<String> = redis::cmd("GET").arg("zeep:network").query_async(redis).await?;
+    if r.as_deref() != Some(cfg.zeep_env.as_str()) {
+        anyhow::bail!("this Redis belongs to {}; refusing to run {} on it", r.unwrap_or_default(), cfg.zeep_env);
+    }
+    Ok(())
 }
 
 pub fn init_tracing() {

@@ -16,6 +16,8 @@ import { poseidon1, poseidon2 } from "poseidon-lite";
 import { bytesToField } from "./field";
 
 export interface ZeepKeys {
+  /** The network these keys belong to; ZeepClient refuses an API on another network. */
+  network: "testnet" | "mainnet";
   sk: bigint;
   pk: bigint;
   /** AES-256-GCM key for note backups (raw bytes). */
@@ -35,16 +37,27 @@ export function seedFromPhrase(phrase: string): Uint8Array {
   return mnemonicToSeedSync(words);
 }
 
-export function deriveKeys(seed: Uint8Array): ZeepKeys {
-  const sk = bytesToField(derive(seed, "zeep-sk-v1")) || 1n;
+export type ZeepNetwork = "testnet" | "mainnet";
+
+/**
+ * All Zeep keys for one network. The same phrase gives completely different keys on testnet
+ * and mainnet (the network is part of every derivation), so nothing seen on testnet — intent
+ * ids, vault id/auth, nullifiers, tags — can be used or linked on mainnet. Pass the API's
+ * `network` from /v1/config.
+ */
+export function deriveKeys(seed: Uint8Array, network: ZeepNetwork): ZeepKeys {
+  if (network !== "testnet" && network !== "mainnet") throw new Error("deriveKeys needs network 'testnet' or 'mainnet'");
+  const k = (info: string) => derive(seed, `${info}:${network}`);
+  const sk = bytesToField(k("zeep-sk-v1")) || 1n;
   return {
+    network,
     sk,
     pk: poseidon1([sk]),
-    noteKey: derive(seed, "zeep-note-enc-v1"),
-    vaultKey: derive(seed, "zeep-vault-enc-v1"),
-    vaultId: bytesToHex(derive(seed, "zeep-vault-id-v1")),
-    vaultAuth: bytesToHex(derive(seed, "zeep-vault-auth-v1")),
-    intentKey: derive(seed, "zeep-intent-v1"),
+    noteKey: k("zeep-note-enc-v1"),
+    vaultKey: k("zeep-vault-enc-v1"),
+    vaultId: bytesToHex(k("zeep-vault-id-v1")),
+    vaultAuth: bytesToHex(k("zeep-vault-auth-v1")),
+    intentKey: k("zeep-intent-v1"),
   };
 }
 

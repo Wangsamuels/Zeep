@@ -34,6 +34,8 @@ export interface SpendPlan {
   transfer?: { pk: bigint; amount: bigint; noteKey?: Uint8Array };
   /** Reveal today's tag for this purpose (withdrawal / deposit rebate). Default: random tag. */
   daily?: 1 | 2;
+  /** Secret of the refund note; its owner tag must already be bound into `signal` (pay()). */
+  refundRho?: bigint;
 }
 
 export interface BuiltSpend {
@@ -103,7 +105,7 @@ export async function buildSpend(keys: ZeepKeys, plan: SpendPlan, paths: Paths, 
   const expect = [...input.root, ...input.nullifier, ...input.outCommitment, input.cost, input.asset, input.signalHash, input.tag, input.tagEpoch, input.tagPurpose];
   if (publicSignals.join() !== expect.join()) throw new Error("prover returned unexpected public signals");
 
-  const refundRho = randomField();
+  const refundRho = plan.refundRho ?? randomField();
   return {
     bundle: {
       root: [input.root[0], input.root[1]],

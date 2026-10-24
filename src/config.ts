@@ -49,9 +49,23 @@ const Env = z.object({
   // "Credits" are how the app shows dollars: MICRO_USD_PER_CREDIT (default 1 credit = $1).
   MICRO_USD_PER_CREDIT: int(1_000_000),
   MIN_DEPOSIT_ZATS: int(100_000),
-  DEPOSIT_INTENT_TTL_HOURS: int(72),
+  DEPOSIT_INTENT_TTL_HOURS: int(24), // an unpaid intent expires (its address is still watched 7 more days)
   ZEC_USD_FALLBACK: z.coerce.number().positive().default(50),
-  PRICE_REFRESH_SEC: int(300),
+  PRICE_REFRESH_SEC: int(60), // the treasury refreshes the shared quote this often
+  // Money operations (crediting deposits, refills, withdrawals) need a live quote no older than
+  // this, and refuse to run on the fallback price unless ALLOW_PRICE_FALLBACK (testnet only).
+  PRICE_MAX_AGE_SEC: int(120),
+  ALLOW_PRICE_FALLBACK: bool(false),
+  // Anti-spam for deposit intents (each one takes a deposit address): a proof of work of
+  // INTENT_POW_BITS leading zero bits, and a cap on unpaid open intents.
+  INTENT_POW_BITS: int(16),
+  MAX_OPEN_INTENTS: int(20_000),
+  // Spent-note lookups by bucket (top bits of the nullifier), so a client never sends its exact nullifiers.
+  NULLIFIER_BUCKET_BITS: int(12),
+  // The public reserve books are published at most this often, rounded, so single payments can't be read off them.
+  RESERVE_PUBLISH_SEC: int(3600),
+  ALLOW_NO_RELAY: bool(false),
+  TESTNET_LIVE_MPP: bool(false),
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
@@ -92,6 +106,9 @@ const Env = z.object({
   SPEND_WASM_URL: z.string().default('/circuits/zeep_spend.wasm'),
   SPEND_ZKEY_URL: z.string().default('/circuits/zeep_spend.zkey'),
   SPEND_ZKEY_SHA256: z.string().default(''),
+  // Total ZEC credited per UTC day, on either network (later deposits wait for the next day).
+  // A safety limit for launches; unset = no limit. TESTNET_MAX_DEPOSIT_ZATS_PER_DAY is the old name.
+  MAX_DEPOSIT_ZATS_PER_DAY: z.coerce.number().int().positive().optional(),
   TESTNET_MAX_DEPOSIT_ZATS_PER_DAY: z.coerce.number().int().optional(),
   VAULT_MAX_ITEM_KB: int(512),
   VAULT_MAX_ITEMS: int(2000),
@@ -197,12 +214,50 @@ const Env = z.object({
 
 export type Config = z.infer<typeof Env>;
 
+/**
+ * Testnet and mainnet must never mix: one network per app, database and Redis, and mainnet
+ * only with real rails, a pinned verifying key and live prices. Returns the problems found.
+ */
+export function networkProblems(c: Config): string[] {
+  const p: string[] = [];
+  const main = c.ZEEP_ENV === 'mainnet';
+  if (main !== (c.ZCASH_NETWORK === 'main')) p.push(`ZEEP_ENV=${c.ZEEP_ENV} needs ZCASH_NETWORK=${main ? 'main' : 'test'}`);
+  const ua = main ? /^u1[02-9ac-hj-np-z]+$/ : /^utest1[02-9ac-hj-np-z]+$/;
+  if (c.ZEEP_RECEIVE_UA && !ua.test(c.ZEEP_RECEIVE_UA)) p.push(`ZEEP_RECEIVE_UA is not a ${c.ZCASH_NETWORK}net unified address`);
+  const taddr = main ? /^t1[1-9A-HJ-NP-Za-km-z]{33}$/ : /^tm[1-9A-HJ-NP-Za-km-z]{33}$/;
+  if (c.ZEEP_RESERVE_TADDR && !taddr.test(c.ZEEP_RESERVE_TADDR)) p.push(`ZEEP_RESERVE_TADDR is not a ${c.ZCASH_NETWORK}net transparent (P2PKH) address`);
+  if (c.TREASURY_REFUND_TO && !taddr.test(c.TREASURY_REFUND_TO)) p.push(`TREASURY_REFUND_TO is not a ${c.ZCASH_NETWORK}net transparent address`);
+  if (!main) {
+    // Testnet ZEC is free: it must never move real money. The rails are always simulated, and
+    // real paid services only with an explicit opt-in (keep MPP_DAILY_BUDGET_USD small).
+    if (c.TREASURY_RAILS !== 'mock') p.push('testnet needs TREASURY_RAILS=mock (live rails would sell free testnet ZEC for real USDC)');
+    if (c.MPP_MODE === 'live' && !c.TESTNET_LIVE_MPP) p.push('testnet with MPP_MODE=live needs TESTNET_LIVE_MPP=true (real USDC pays for services bought with free testnet ZEC)');
+  }
+  if (main) {
+    if (c.TREASURY_RAILS !== 'live') p.push('mainnet needs TREASURY_RAILS=live');
+    if (c.MPP_MODE !== 'live') p.push('mainnet needs MPP_MODE=live');
+    if (!c.SPEND_VKEY_SHA256) p.push('mainnet needs SPEND_VKEY_SHA256 (pin the verifying key from the ceremony)');
+    if (c.ALLOW_PRICE_FALLBACK) p.push('ALLOW_PRICE_FALLBACK is not allowed on mainnet');
+    if (!c.REQUIRE_RELAY && !c.ALLOW_NO_RELAY) p.push('mainnet needs REQUIRE_RELAY=true (or ALLOW_NO_RELAY=true to accept that Heroku logs client IPs)');
+    if (/testnet|localhost|127\.0\.0\.1/.test(c.PUBLIC_API_BASE_URL)) p.push('PUBLIC_API_BASE_URL looks like a testnet/local URL');
+  }
+  return p;
+}
+
 function load(): Config {
   const parsed = Env.safeParse(process.env);
   if (!parsed.success) {
     const msg = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
     throw new Error(`Invalid configuration: ${msg}`);
   }
+  let problems = networkProblems(parsed.data);
+  // End-to-end tests run mainnet settings against the simulated chain and mock rails. Never
+  // possible on Heroku (DYNO is set there) or outside NODE_ENV=test.
+  if (process.env.ZEEP_TEST_SIMULATION === '1') {
+    if (process.env.DYNO || parsed.data.NODE_ENV !== 'test') throw new Error('ZEEP_TEST_SIMULATION is for local tests only');
+    problems = problems.filter((m) => /ZCASH_NETWORK|ZEEP_RECEIVE_UA|ZEEP_RESERVE_TADDR|TREASURY_REFUND_TO/.test(m));
+  }
+  if (problems.length) throw new Error(`Invalid configuration for ${parsed.data.ZEEP_ENV}: ${problems.join('; ')}`);
   return parsed.data;
 }
 

@@ -7,6 +7,7 @@ build:
   docker:
     web: Dockerfile.node
     treasury: Dockerfile.node
+    wallet: Dockerfile.rust
     watcher: Dockerfile.rust
     payouts: Dockerfile.rust
 release:
@@ -16,5 +17,8 @@ release:
 run:
   web: node dist/server.js
   treasury: node dist/workers/treasury.js
+  # CHAIN_BACKEND=lightclient: run exactly one `wallet` dyno (Standard-2X); keep watcher/payouts at 0.
+  wallet: /app/bin/zeep-wallet
+  # CHAIN_BACKEND=rpc (Zallet on a VPS): run watcher=1 and payouts=1 instead of wallet.
   watcher: /app/bin/zeep-watcher
   payouts: /app/bin/zeep-payouts

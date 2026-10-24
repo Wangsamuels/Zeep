@@ -52,7 +52,9 @@ export default async function publicRoutes(app: FastifyInstance) {
         fee_bps: cfg.DEPOSIT_FEE_BPS, // on the converted (dollar) half only
         confirmations: Number(process.env.MIN_CONFIRMATIONS ?? 3),
         intent_ttl_hours: cfg.DEPOSIT_INTENT_TTL_HOURS,
+        pow_bits: cfg.INTENT_POW_BITS, // sha256("zeep-intent-pow-v1:" + intent_id + ":" + pow) leading zero bits
       },
+      nullifier_bucket_bits: cfg.NULLIFIER_BUCKET_BITS,
       withdrawals: {
         min_micro_usd: cfg.MIN_WITHDRAWAL_MICRO_USD,
         fee_bps: cfg.WITHDRAWAL_FEE_BPS,
@@ -69,7 +71,7 @@ export default async function publicRoutes(app: FastifyInstance) {
         zkey_sha256: cfg.SPEND_ZKEY_SHA256,
         vkey_url: cfg.SPEND_VKEY_URL,
         vkey_sha256: cfg.SPEND_VKEY_SHA256,
-        signal: 'x = sha256("zeep-req-v1\\n" + METHOD + "\\n" + path + "\\n" + hex(sha256(raw body))) mod r',
+        signal: 'x = sha256("zeep-req-v2\\n" + METHOD + "\\n" + path + "\\n" + hex(sha256(raw body)) + "\\n" + refund_d) mod r  (refund_d = compensate.d, or 0)',
       },
       trees: {
         current: { id: t.id, size: t.size, root: t.root },
@@ -117,27 +119,45 @@ export default async function publicRoutes(app: FastifyInstance) {
   });
 
   /**
-   * Which of these nullifiers are spent? Used when restoring on a new device. Clients mix
-   * in random decoys, and nothing is logged, but the query does tell the server that the
-   * asker holds some of these notes; the app only calls it on restore and periodic sync.
+   * Spent nullifiers by bucket (the top NULLIFIER_BUCKET_BITS bits). A client asks for the
+   * buckets its notes fall in and checks locally, so the server never learns which exact
+   * nullifiers (notes) it holds; each bucket is shared by many users' notes.
    */
-  app.post('/v1/nullifiers/check', async (req) => {
-    const list = (req.body as { nullifiers?: unknown })?.nullifiers;
-    if (!Array.isArray(list) || list.length > 1000 || !list.every((n) => typeof n === 'string' && /^[0-9]{1,78}$/.test(n))) {
-      throw errors.bad('send { nullifiers: [decimal strings] } (max 1000)');
+  app.post('/v1/nullifiers/buckets', async (req) => {
+    const list = (req.body as { buckets?: unknown })?.buckets;
+    const max = 2 ** cfg.NULLIFIER_BUCKET_BITS;
+    if (!Array.isArray(list) || list.length > 64 || !list.every((b) => Number.isInteger(b) && b >= 0 && b < max)) {
+      throw errors.bad(`send { buckets: [integers below ${max}] } (max 64)`);
     }
-    const rows = await q<{ nullifier: string }>('SELECT nullifier::text FROM nullifiers WHERE nullifier = ANY($1::numeric[])', [list]);
-    const spent = new Set(rows.map((r) => r.nullifier));
-    return { spent: list.map((n: string) => spent.has(BigInt(n).toString())) };
+    const shift = BigInt(254 - cfg.NULLIFIER_BUCKET_BITS);
+    const out: Record<string, string[]> = {};
+    for (const b of new Set(list as number[])) {
+      const lo = BigInt(b) << shift;
+      const hi = BigInt(b + 1) << shift;
+      const rows = await q<{ n: string }>('SELECT nullifier::text AS n FROM nullifiers WHERE nullifier >= $1 AND nullifier < $2', [lo.toString(), hi.toString()]);
+      out[b] = rows.map((r) => r.n);
+    }
+    return { bits: cfg.NULLIFIER_BUCKET_BITS, spent: out };
   });
 
+  // Published at most every RESERVE_PUBLISH_SEC and rounded ($1, 0.01 ZEC), so nobody can
+  // diff consecutive snapshots to read off a single deposit, refill or withdrawal.
   app.get('/v1/reserve', async (_req, reply) => {
-    reply.header('cache-control', 'public, max-age=60');
+    reply.header('cache-control', `public, max-age=${Math.min(cfg.RESERVE_PUBLISH_SEC, 600)}`);
     const cached = await redis.get(keys.reserve);
     if (cached) return JSON.parse(cached);
-    const books = await reserveBooks();
-    const body = { ...books, books_sha256: sha256hex(JSON.stringify(books)) };
-    await redis.set(keys.reserve, JSON.stringify(body), 'EX', 60);
+    const books = roundBooks(await reserveBooks()) as Record<string, unknown>;
+    const body = { ...books, rounded: { micro_usd: 1_000_000, zats: 1_000_000 }, books_sha256: sha256hex(JSON.stringify(books)) };
+    await redis.set(keys.reserve, JSON.stringify(body), 'EX', cfg.RESERVE_PUBLISH_SEC);
     return body;
   });
+}
+
+/** Round every *_micro_usd field to $1 and every *_zats field to 0.01 ZEC. Ratios stay exact. */
+export function roundBooks(v: unknown, key = ''): unknown {
+  if (Array.isArray(v)) return v.map((x) => roundBooks(x));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, roundBooks(x, k)]));
+  if (typeof v === 'number' && /(_micro_usd|_zats)$/.test(key)) return Math.round(v / 1_000_000) * 1_000_000;
+  if (typeof v === 'number' && key === 'owed_credits') return Math.round(v);
+  return v;
 }

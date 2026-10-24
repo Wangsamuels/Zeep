@@ -26,12 +26,29 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros"] }
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# Light client (CHAIN_BACKEND=lightclient): the official Zcash wallet crates, Ironwood-ready.
+zcash_client_backend = { version = "0.25", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "transparent-inputs", "sync"] }
+zcash_client_sqlite = { version = "0.23", features = ["orchard", "transparent-inputs"] }
+zcash_keys = { version = "0.17", features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_primitives = "0.31"
+zcash_proofs = { version = "0.31", features = ["bundled-prover"] }
+zcash_protocol = "0.11"
+zcash_address = "0.14"
+transparent = { package = "zcash_transparent", version = "0.11", features = ["transparent-inputs"] }
+zip32 = "0.3"
+zip321 = "0.10"
+tonic = { version = "0.14", features = ["tls-webpki-roots"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+secrecy = "0.8"
+bip0039 = { version = "0.14", features = ["std"] }
+rand10 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
 
 [profile.release]
 lto = "thin"

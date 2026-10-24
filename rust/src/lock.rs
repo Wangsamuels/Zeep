@@ -1,4 +1,4 @@
-//! Redis single-holder lease (`zeep:lock:<name>`, 60 s), compatible with withLock() in Node.
+//! Redis single-holder lease (`zeep:<env>:lock:<name>`, 60 s), compatible with withLock() in Node.
 
 use anyhow::Result;
 use rand::RngCore;
@@ -11,10 +11,10 @@ pub struct Lease {
 }
 
 impl Lease {
-    pub fn new(name: &str, ttl_ms: u64) -> Self {
+    pub fn new(ns: &str, name: &str, ttl_ms: u64) -> Self {
         let mut b = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut b);
-        Self { key: format!("zeep:lock:{name}"), token: hex::encode(b), ttl_ms }
+        Self { key: format!("{ns}:lock:{name}"), token: hex::encode(b), ttl_ms }
     }
 
     /// Acquire, or renew if we already hold it. Returns whether we hold the lease now.

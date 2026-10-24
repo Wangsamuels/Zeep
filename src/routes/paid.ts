@@ -4,8 +4,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { cfg } from '../config.js';
 import { errors, ZeepError } from '../lib/errors.js';
 import { bundleFromHeaders, notesHeader, requestSignal, spend, USD, type Spent } from '../notes/spend.js';
-import { addBooks } from '../services/books.js';
-import { marginOf } from '../services/fees.js';
+import { chargeCtx } from '../services/mpp.js';
 import { requiredMicroUsd } from '../services/prices.js';
 
 declare module 'fastify' {
@@ -20,24 +19,33 @@ declare module 'fastify' {
  */
 export async function chargeRequest(req: FastifyRequest, reply: FastifyReply, usd: number): Promise<Spent> {
   const minCost = requiredMicroUsd(usd);
+  const bundle = bundleFromHeaders(req.headers);
   const s = await spend({
-    bundle: bundleFromHeaders(req.headers),
-    signal: requestSignal(req.method, req.url, req.rawBody),
+    bundle,
+    signal: requestSignal(req.method, req.url, req.rawBody, bundle?.compensate?.d ?? 0n),
     asset: USD,
     minCost,
     book: 'service',
   });
-  await addBooks(null, 'margin', marginOf(s.cost));
   reply.header('x-zeep-notes', notesHeader(s.notes));
   reply.header('x-zeep-cost', s.cost.toString());
   return s;
 }
 
-/** Run the upstream call; if it fails before anything was sent, the cost comes back as a new note. */
+/**
+ * Run the upstream call; if it fails before anything was sent, the cost comes back as a new
+ * note — unless Zeep already paid the upstream for it (an MPP payment was signed). Then the
+ * call is not refundable, so failing requests can't drain the treasury's MPP budget for free.
+ */
 export async function withCharge<T>(s: Spent, reply: FastifyReply, fn: () => Promise<T>): Promise<T> {
+  const call = { upstreamPaid: false };
   try {
-    return await fn();
+    return await chargeCtx.run(call, fn);
   } catch (e) {
+    if (call.upstreamPaid) {
+      if (e instanceof ZeepError) e.extra = { ...e.extra, refunded: false };
+      throw e;
+    }
     if (!reply.sent && !reply.raw.headersSent) {
       const back = await s.compensate().catch(() => null);
       if (back && e instanceof ZeepError) e.extra = { ...e.extra, compensation: { tree: back.tree, index: back.indexes[0] } };

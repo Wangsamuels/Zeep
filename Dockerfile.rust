@@ -1,4 +1,4 @@
-# watcher and payouts
+# wallet (light client), plus watcher and payouts for CHAIN_BACKEND=rpc|dev
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
@@ -7,6 +7,6 @@ RUN cargo build --release --locked --bins
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/zeep-watcher /src/target/release/zeep-payouts /app/bin/
+COPY --from=build /src/target/release/zeep-wallet /src/target/release/zeep-watcher /src/target/release/zeep-payouts /app/bin/
 USER nobody
-CMD ["/app/bin/zeep-watcher"]
+CMD ["/app/bin/zeep-wallet"]

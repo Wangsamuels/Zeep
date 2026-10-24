@@ -7,15 +7,16 @@ import { Queue, Worker } from 'bullmq';
 import { cfg } from '../config.js';
 import { pool, q } from '../lib/db.js';
 import { log } from '../lib/log.js';
-import { keys, newRedis, redis, withLock } from '../lib/redis.js';
+import { checkRedisNetwork, keys, newRedis, redis, withLock } from '../lib/redis.js';
+import { checkDbNetwork } from '../migrate.js';
+import { refreshPrice } from '../services/prices.js';
 import { reserveBooks } from '../services/reserve.js';
 import { floatTick } from '../treasury/float.js';
 
 const QUEUE = 'treasury';
-const PREFIX = 'zeep:q';
+const PREFIX = keys.queuePrefix;
 
 export async function reserveCheck(): Promise<void> {
-  await redis.del(keys.reserve);
   const b = await reserveBooks();
   for (const [asset, bps] of [['zec', b.zec.coverage_bps], ['usd', b.usd.coverage_bps]] as const) {
     if (bps < cfg.RESERVE_COVERAGE_MIN_BPS) log.error({ asset, coverage_pct: bps / 100, zec: b.zec, usd: b.usd }, 'ALERT reserve below coverage floor');
@@ -43,7 +44,10 @@ export async function housekeeping(): Promise<void> {
     q(`DELETE FROM daily_tags WHERE day < $1 RETURNING 1`, [Math.floor(Date.now() / 86_400_000) - 2]),
     q(`DELETE FROM inboxes WHERE expires_at < now() RETURNING 1`),
     q(`DELETE FROM vault_items WHERE expires_at IS NOT NULL AND expires_at < now() RETURNING 1`),
+    // Only withdrawals whose tranches exist and are all confirmed; never one still converting.
     q(`UPDATE withdrawals w SET payout_addr_enc = NULL, status = 'done' WHERE payout_addr_enc IS NOT NULL
+        AND w.status IN ('scheduled','paying','done')
+        AND EXISTS (SELECT 1 FROM payouts p WHERE p.withdrawal_id = w.id)
         AND NOT EXISTS (SELECT 1 FROM payouts p WHERE p.withdrawal_id = w.id AND p.status <> 'confirmed') RETURNING 1`),
     q(`DELETE FROM upstream_daily WHERE day < now() - interval '400 days' RETURNING 1`),
   ]);
@@ -51,17 +55,21 @@ export async function housekeeping(): Promise<void> {
 }
 
 const handlers: Record<string, () => Promise<unknown>> = {
+  prices: refreshPrice,
   float: floatTick,
   reserve: reserveCheck,
   housekeeping,
 };
 
 async function main() {
+  await checkDbNetwork();
+  await checkRedisNetwork();
   const connection = newRedis();
   const queue = new Queue(QUEUE, { connection, prefix: PREFIX });
   await queue.upsertJobScheduler('float', { every: cfg.FLOAT_TICK_SEC * 1000 }, { name: 'float' });
   await queue.upsertJobScheduler('reserve', { every: 10 * 60_000 }, { name: 'reserve' });
   await queue.upsertJobScheduler('housekeeping', { every: 60 * 60_000 }, { name: 'housekeeping' });
+  await queue.upsertJobScheduler('prices', { every: Math.max(30, cfg.PRICE_REFRESH_SEC) * 1000 }, { name: 'prices' });
 
   const worker = new Worker(
     QUEUE,

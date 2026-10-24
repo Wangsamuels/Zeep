@@ -1,7 +1,9 @@
 // Release-phase entry point: apply pending SQL migrations and open the first note tree.
+import { randomBytes } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cfg } from './config.js';
 import { pool, tx } from './lib/db.js';
 import { log } from './lib/log.js';
 
@@ -22,6 +24,25 @@ export async function migrate(): Promise<void> {
     });
   }
   await pool.query('INSERT INTO trees (size) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM trees)');
+  await stampNetwork();
+}
+
+/** A database belongs to one network forever. Stamped on first migrate, checked on every boot. */
+export async function stampNetwork(): Promise<void> {
+  await pool.query(`INSERT INTO meta (key, value) VALUES ('network', $1) ON CONFLICT (key) DO NOTHING`, [cfg.ZEEP_ENV]);
+  // Permanent salt for stored deposit hashes (never rotates, unlike secrets in config).
+  await pool.query(`INSERT INTO meta (key, value) VALUES ('txid_salt', $1) ON CONFLICT (key) DO NOTHING`, [randomBytes(32).toString('hex')]);
+  await checkDbNetwork();
+}
+
+export async function checkDbNetwork(): Promise<void> {
+  const r = await pool.query<{ value: string }>(`SELECT value FROM meta WHERE key = 'network'`);
+  const got = r.rows[0]?.value;
+  if (got !== cfg.ZEEP_ENV) {
+    throw new Error(got
+      ? `This database belongs to ${got}; refusing to run ${cfg.ZEEP_ENV} on it. Use a separate Heroku app and database per network.`
+      : 'Database has no network stamp; run the release phase (migrate) first.');
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

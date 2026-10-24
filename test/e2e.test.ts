@@ -18,7 +18,11 @@ import { redis } from '../src/lib/redis.js';
 import { migrate } from '../src/migrate.js';
 import { registry } from '../src/notes/registry.js';
 import { buildApp } from '../src/server.js';
-import { floatTick } from '../src/treasury/float.js';
+import { floatTick, zecOwedZats } from '../src/treasury/float.js';
+import { checkRedisNetwork } from '../src/lib/redis.js';
+import { checkDbNetwork } from '../src/migrate.js';
+import { reserveBooks } from '../src/services/reserve.js';
+import { housekeeping } from '../src/workers/treasury.js';
 import { deriveKeys, NoteBook, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
 import { nodeProve } from './helpers/prove.js';
 
@@ -44,9 +48,11 @@ before(async () => {
   await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
   await redis.flushdb();
   await migrate();
+  await redis.del('zeep:network');
+  await checkRedisNetwork();
   const env = {
     ...process.env, CHAIN_BACKEND: 'dev', DEV_BLOCK_SECS: '1', DEV_GENESIS_UNIX: String(DEV_GENESIS),
-    MIN_CONFIRMATIONS: '1', POLL_SECS: '1', LOG_LEVEL: 'warn', ADDRESS_POOL_MIN: '5',
+    MIN_CONFIRMATIONS: '1', POLL_SECS: '1', LOG_LEVEL: 'warn', ADDRESS_POOL_MIN: '8',
   };
   for (const b of ['zeep-watcher', 'zeep-payouts']) workers.push(spawn(BIN + b, { env, stdio: ['ignore', 'inherit', 'inherit'] }));
   await registry.boot();
@@ -67,7 +73,8 @@ after(async () => {
 });
 
 const phrase = generateMnemonic(wordlist, 256);
-const keys = deriveKeys(seedFromPhrase(phrase));
+const NET = process.env.ZEEP_ENV === 'mainnet' ? 'mainnet' : 'testnet';
+const keys = deriveKeys(seedFromPhrase(phrase), NET);
 const alice = new ZeepClient({ baseUrl: '', keys, book: new NoteBook(), prove: nodeProve });
 
 async function payInto(address: string, zats: number) {
@@ -94,7 +101,9 @@ async function payOut(id: string) {
 
 const fee = (value: number, bps: number) => Math.ceil((value * bps) / 10_000);
 const usdOf = (zats: number) => Math.floor((zats / 1e8) * 50 * 1e6); // ZEC at $50 (test price)
-const SAPLING = 'ztestsapling1' + 'q'.repeat(75);
+const MAIN = process.env.ZEEP_ENV === 'mainnet';
+const SAPLING = (MAIN ? 'zs1' : 'ztestsapling1') + 'q'.repeat(75);
+const TADDR = (MAIN ? 't1' : 'tm') + 'B'.repeat(33);
 
 test('deposit any ZEC amount → half kept as ZEC, half fixed dollars minus 1.5%; first of the day gets its network fee back', { timeout: 90_000 }, async () => {
   (alice as unknown as { base: string }).base = base;
@@ -209,7 +218,7 @@ test('withdraw: from ZEC instantly; beyond the ZEC balance credits convert back 
   assert.equal(alice.balance(ZEC), zec0 - 4_000_000n);
 
   // 2) Transparent needs the opt-in; the second withdrawal today pays its own network fees.
-  const taddr = 'tm' + 'B'.repeat(33);
+  const taddr = TADDR;
   const p2 = await alice.planWithdrawal(2_500_000n);
   await assert.rejects(alice.withdraw(p2, taddr), /allow_transparent/);
   const w2 = await alice.withdraw(p2, taddr, { allowTransparent: true });
@@ -245,8 +254,84 @@ test('withdraw: from ZEC instantly; beyond the ZEC balance credits convert back 
   assert.ok(done.tranches.length === 2 && done.tranches.every((x: { status: string; txid: string }) => x.status === 'confirmed' && x.txid));
 });
 
+test('safety: housekeeping never touches a withdrawal that is still converting credits', { timeout: 180_000 }, async () => {
+  const p = await alice.planWithdrawal(1_000_000n); // the ZEC balance is empty now: all from credits
+  assert.equal(p.needsConversion, true);
+  const w = await alice.withdraw(p, SAPLING);
+  assert.equal(w.status, 'converting');
+  await housekeeping(); // runs hourly in production
+  const [row] = await q<{ status: string; enc: string | null }>('SELECT status, payout_addr_enc AS enc FROM withdrawals WHERE id = $1', [w.withdrawal_id]);
+  assert.equal(row.status, 'converting');
+  assert.ok(row.enc, 'payout address kept while converting');
+  await settleFloat();
+  await sleep(1500);
+  await payOut(w.withdrawal_id);
+  await housekeeping();
+  assert.equal((await alice.withdrawalStatus(w.withdrawal_id)).status, 'done');
+});
+
+test('safety: two payments to one deposit address become one credit plus a claim (no duplicate notes)', { timeout: 120_000 }, async () => {
+  const before = alice.balances();
+  const d = await alice.startDeposit(4_000_000n);
+  await payInto(d.address, 4_000_000);
+  await payInto(d.address, 2_000_000); // same block: the activator sees both in one batch
+  await until(async () => (await alice.depositStatus(d.slot)).credited);
+  const st = await alice.depositStatus(d.slot); // sees the second payment as unclaimed → claims it
+  const claimSlot = alice.book.nextDeposit - 1;
+  assert.notEqual(claimSlot, d.slot);
+  await until(async () => (await alice.depositStatus(claimSlot)).credited);
+  const c1 = st.credited!;
+  const c2 = (await alice.depositStatus(claimSlot)).credited!;
+  assert.equal(c1.zec_zats + c2.zec_zats, 6_000_000); // both payments credited, once each
+  assert.equal(alice.balance(ZEC), before.zec + BigInt(c1.zec.amount_zats + c2.zec.amount_zats));
+  const [dup] = await q<{ n: number }>('SELECT count(*)::int AS n FROM (SELECT commitment FROM notes GROUP BY commitment HAVING count(*) > 1) x');
+  assert.equal(dup.n, 0);
+  await sleep(1500);
+  await settleFloat();
+});
+
+test('safety: deposits still confirming count as owed ZEC, so the float never converts them', async () => {
+  const [i] = await q<{ id: string }>('SELECT id FROM deposit_intents LIMIT 1');
+  const before = await zecOwedZats();
+  await q('INSERT INTO deposit_sightings (intent_id, txid_hash, amount_zats, confirmations) VALUES ($1, $2, $3, 0)', [i.id, 'test-sighting', 100_000_000]);
+  assert.equal(await zecOwedZats(), before + 100_000_000);
+  await q(`DELETE FROM deposit_sightings WHERE txid_hash = 'test-sighting'`);
+});
+
+test('network guard: every process refuses a database or Redis that belongs to the other network', { timeout: 60_000 }, async () => {
+  const other = MAIN ? 'testnet' : 'mainnet';
+  await q(`UPDATE meta SET value = $1 WHERE key = 'network'`, [other]);
+  try {
+    await assert.rejects(checkDbNetwork(), new RegExp(`belongs to ${other}`));
+    // The Rust workers refuse too, before touching the wallet.
+    const out = await new Promise<{ code: number | null; err: string }>((resolve) => {
+      const p = spawn(BIN + 'zeep-watcher', { env: { ...process.env, CHAIN_BACKEND: 'dev', POLL_SECS: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let err = '';
+      p.stdout!.on('data', (b) => (err += b));
+      p.stderr!.on('data', (b) => (err += b));
+      p.on('exit', (code) => resolve({ code, err }));
+    });
+    assert.notEqual(out.code, 0);
+    assert.match(out.err, /belongs to/);
+  } finally {
+    await q(`UPDATE meta SET value = $1 WHERE key = 'network'`, [MAIN ? 'mainnet' : 'testnet']);
+  }
+  await redis.set('zeep:network', other);
+  try {
+    await assert.rejects(checkRedisNetwork(), /belongs to/);
+  } finally {
+    await redis.set('zeep:network', MAIN ? 'mainnet' : 'testnet');
+  }
+  // And a worker whose ZEEP_ENV and ZCASH_NETWORK disagree won't start at all.
+  const bad = await new Promise<number | null>((resolve) => {
+    const p = spawn(BIN + 'zeep-payouts', { env: { ...process.env, ZCASH_NETWORK: MAIN ? 'test' : 'main' }, stdio: 'ignore' });
+    p.on('exit', resolve);
+  });
+  assert.notEqual(bad, 0);
+});
+
 test('restore from the 24 words alone finds both exact balances', { timeout: 120_000 }, async () => {
-  const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(phrase)), book: new NoteBook(), prove: nodeProve });
+  const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(phrase), NET), book: new NoteBook(), prove: nodeProve });
   await fresh.restore();
   assert.deepEqual(fresh.balances(), alice.balances());
   assert.ok(fresh.book.nextDeposit >= 2);
@@ -254,8 +339,7 @@ test('restore from the 24 words alone finds both exact balances', { timeout: 120
 
 test('reserve: ZEC held covers ZEC owed, dollars held cover dollars owed, and the fees leave a profit', async () => {
   await sleep(1500);
-  await redis.del('zeep:reserve');
-  const b = await (await fetch(`${base}/v1/reserve`)).json();
+  const b = await reserveBooks(); // exact (the public endpoint is rounded)
   assert.equal(b.usd.notes_micro_usd, Number(alice.balance(USD)), JSON.stringify(b));
   assert.equal(b.zec.notes_zats, Number(alice.balance(ZEC)), JSON.stringify(b));
   assert.ok(b.zec.coverage_bps >= 10_000, JSON.stringify(b.zec));
@@ -263,16 +347,19 @@ test('reserve: ZEC held covers ZEC owed, dollars held cover dollars owed, and th
   assert.ok(b.profit.conversion_fees_micro_usd > b.profit.conversion_costs_micro_usd, JSON.stringify(b.profit));
   assert.ok(b.profit.net_micro_usd > 0, JSON.stringify(b.profit));
   console.log('reserve', JSON.stringify({ zec: b.zec, usd: b.usd, coverage_pct: b.coverage_pct, profit: b.profit }));
+  const pub = await (await fetch(`${base}/v1/reserve`)).json();
+  assert.equal(pub.usd.owed_micro_usd % 1_000_000, 0); // published rounded to $1
+  assert.equal(pub.zec.owed_zats % 1_000_000, 0); // and 0.01 ZEC
 });
 
 test('encrypted vault: chat items with 30-day auto-delete, auth required', async () => {
-  const url = `${base}/v1/vault/${keys.vaultId}/items/chat-1`;
-  const h = { 'content-type': 'application/json', 'x-vault-auth': keys.vaultAuth };
+  const url = `${base}/v1/vault/items/chat-1`;
+  const h = { 'content-type': 'application/json', 'x-vault-id': keys.vaultId, 'x-vault-auth': keys.vaultAuth };
   const expires = new Date(Date.now() + 30 * 86_400_000).toISOString();
   assert.equal((await fetch(url, { method: 'PUT', headers: h, body: JSON.stringify({ blob: 'AAAA', expires_at: expires }) })).status, 204);
   assert.equal((await (await fetch(url, { headers: h })).json()).blob, 'AAAA');
   assert.equal((await fetch(url, { headers: { ...h, 'x-vault-auth': 'f'.repeat(64) } })).status, 401);
   await q(`UPDATE vault_items SET expires_at = now() - interval '1 second'`);
   assert.equal((await fetch(url, { headers: h })).status, 404);
-  assert.equal((await fetch(`${base}/v1/vault/${keys.vaultId}`, { method: 'DELETE', headers: h })).status, 204);
+  assert.equal((await fetch(`${base}/v1/vault`, { method: 'DELETE', headers: h })).status, 204);
 });

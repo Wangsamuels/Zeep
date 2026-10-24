@@ -2,12 +2,15 @@ import pg from 'pg';
 import { cfg, isProd } from '../config.js';
 
 // NUMERIC/BIGINT come back as strings; keep them that way (zats can exceed 2^53 in sums).
+const ssl = isProd || /sslmode=require/.test(cfg.DATABASE_URL) ? { rejectUnauthorized: false } : undefined; // Heroku TLS
 export const pool = new pg.Pool({
   connectionString: cfg.DATABASE_URL,
   max: cfg.DB_POOL_MAX,
-  // Heroku Postgres requires TLS and uses certificates Node can't verify.
-  ssl: isProd || /sslmode=require/.test(cfg.DATABASE_URL) ? { rejectUnauthorized: false } : undefined,
+  ssl,
+  connectionTimeoutMillis: 15_000, // fail a request instead of hanging forever when the pool is exhausted
 });
+/** One connection reserved for note-tree reloads, so a reload never waits behind spends that wait on it. */
+export const reloadPool = new pg.Pool({ connectionString: cfg.DATABASE_URL, max: 1, ssl, connectionTimeoutMillis: 15_000 });
 
 export type Tx = pg.PoolClient;
 

@@ -1,7 +1,8 @@
 node_modules
 dist
 rust/target
-circuits
+circuits/*
+!circuits/zeep_spend_vkey.json
 scratch
 .env*
 .git

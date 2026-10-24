@@ -17,6 +17,9 @@ import { q } from '../lib/db.js';
 
 export type Status = 'pending' | 'success' | 'failed';
 
+/** Thrown when a rail step failed before any money moved (safe to retry). */
+export class NotSent extends Error {}
+
 export interface Rails {
   balances(): Promise<{ tempoUsdc: bigint; baseUsdc: bigint }>;
   /** 1Click quote ZEC → Base USDC. Returns the transparent ZEC deposit address to pay. */
@@ -26,7 +29,8 @@ export interface Rails {
   swapStatus(depositAddress: string): Promise<{ status: Status; amountOut?: bigint }>;
   /** Send Base USDC to a 1Click deposit address. */
   payBaseUsdc(depositAddress: string, usdc: bigint): Promise<void>;
-  bridge(direction: 'base_to_tempo' | 'tempo_to_base', usdc: bigint): Promise<string>;
+  /** Bridge `usdc` (exact input). Returns the Relay request id and the USDC the destination will receive. */
+  bridge(direction: 'base_to_tempo' | 'tempo_to_base', usdc: bigint): Promise<{ requestId: string; amountOut: bigint }>;
   bridgeStatus(requestId: string): Promise<Status>;
 }
 
@@ -114,37 +118,51 @@ const live: Rails = {
     const toTempo = direction === 'base_to_tempo';
     const origin = toTempo ? base : tempoChain();
     const who = account();
-    const res = await fetch(`${cfg.RELAY_API_URL}/quote/v2`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        user: who.address,
-        recipient: who.address,
-        originChainId: toTempo ? base.id : cfg.TEMPO_CHAIN_ID,
-        destinationChainId: toTempo ? cfg.TEMPO_CHAIN_ID : base.id,
-        originCurrency: toTempo ? cfg.BASE_USDC : cfg.TEMPO_USDC_E,
-        destinationCurrency: toTempo ? cfg.TEMPO_USDC_E : cfg.BASE_USDC,
-        amount: usdc.toString(),
-        tradeType: 'EXACT_INPUT',
-      }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!res.ok) throw new Error(`relay quote failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    const quote = (await res.json()) as { steps: { kind: string; requestId?: string; items: { status?: string; data: { to: Hex; data: Hex; value?: string } }[] }[] };
+    // Everything up to the first transaction is safe to retry: any failure here is NotSent.
+    type Quote = {
+      steps: { kind: string; requestId?: string; items: { status?: string; data: { to: Hex; data: Hex; value?: string } }[] }[];
+      details?: { currencyOut?: { amount?: string } };
+    };
+    const getQuote = async (): Promise<Quote> => {
+      const res = await fetch(`${cfg.RELAY_API_URL}/quote/v2`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          user: who.address,
+          recipient: who.address,
+          originChainId: toTempo ? base.id : cfg.TEMPO_CHAIN_ID,
+          destinationChainId: toTempo ? cfg.TEMPO_CHAIN_ID : base.id,
+          originCurrency: toTempo ? cfg.BASE_USDC : cfg.TEMPO_USDC_E,
+          destinationCurrency: toTempo ? cfg.TEMPO_USDC_E : cfg.BASE_USDC,
+          amount: usdc.toString(),
+          tradeType: 'EXACT_INPUT',
+        }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!res.ok) throw new NotSent(`relay quote failed: ${res.status} ${(await res.text()).slice(0, 200)}`);
+      return (await res.json()) as Quote;
+    };
+    let quote: Quote;
+    try {
+      quote = await getQuote();
+    } catch (e) {
+      throw e instanceof NotSent ? e : new NotSent(`relay quote failed: ${(e as Error).message}`);
+    }
+    const amountOut = BigInt(quote.details?.currencyOut?.amount ?? '0');
+    if (amountOut <= 0n || amountOut > usdc) throw new NotSent('relay quote has no usable output amount');
+    if (quote.steps.some((s) => s.kind !== 'transaction')) throw new NotSent('unsupported Relay step');
+    const requestId = quote.steps.find((s) => s.requestId)?.requestId;
+    if (!requestId) throw new NotSent('relay quote had no request id');
     const w = createWalletClient({ account: who, chain: origin, transport: http(toTempo ? cfg.BASE_RPC_URL : undefined) });
     const p = createPublicClient({ chain: origin, transport: http(toTempo ? cfg.BASE_RPC_URL : undefined) });
-    let requestId = '';
     for (const step of quote.steps) {
-      if (step.requestId) requestId ||= step.requestId;
-      if (step.kind !== 'transaction') throw new Error(`unsupported Relay step: ${step.kind}`);
       for (const item of step.items) {
         if (item.status === 'complete') continue;
         const hash = await w.sendTransaction({ to: item.data.to, data: item.data.data, value: BigInt(item.data.value ?? '0'), chain: origin } as never);
         await p.waitForTransactionReceipt({ hash, timeout: 120_000 });
       }
     }
-    if (!requestId) throw new Error('relay quote had no request id');
-    return requestId;
+    return { requestId, amountOut };
   },
 
   async bridgeStatus(requestId) {
@@ -203,14 +221,16 @@ const mock: Rails = {
     mockBase -= usdc;
   },
   async bridge(direction, usdc) {
+    // Relay keeps a small fee (0.05%): what arrives is less than what was sent.
+    const out = usdc - (usdc * 5n) / 10_000n;
     if (direction === 'base_to_tempo') {
       mockBase -= usdc;
-      await q('UPDATE dev_rails SET tempo_usdc = tempo_usdc + $1 WHERE id = 1', [usdc.toString()]);
+      await q('UPDATE dev_rails SET tempo_usdc = tempo_usdc + $1 WHERE id = 1', [out.toString()]);
     } else {
       await q('UPDATE dev_rails SET tempo_usdc = tempo_usdc - $1 WHERE id = 1', [usdc.toString()]);
-      mockBase += usdc;
+      mockBase += out;
     }
-    return `mock-relay-${Date.now()}`;
+    return { requestId: `mock-relay-${Date.now()}`, amountOut: out };
   },
   async bridgeStatus() {
     return 'success';

@@ -14,11 +14,13 @@ pub struct DevChain {
     pool: PgPool,
     genesis: i64,
     block_secs: i64,
+    prefix: &'static str,
 }
 
 impl DevChain {
     pub fn new(pool: PgPool, cfg: &Config) -> Self {
-        Self { pool, genesis: cfg.dev_genesis_unix, block_secs: cfg.dev_block_secs.max(1) }
+        let prefix = if cfg.network == "main" { "u1" } else { "utest1" };
+        Self { pool, genesis: cfg.dev_genesis_unix, block_secs: cfg.dev_block_secs.max(1), prefix }
     }
     fn now_height(&self) -> u32 {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -33,9 +35,9 @@ impl Chain for DevChain {
     }
 
     async fn new_address(&mut self, diversifier_index: u64) -> Result<String> {
-        // Looks like a testnet unified address; only ever shown, never decoded.
+        // Looks like a unified address of the configured network; only ever shown, never decoded.
         const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-        let mut out = String::from("utest1");
+        let mut out = String::from(self.prefix);
         let mut x = diversifier_index.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
         for _ in 0..106 {
             x ^= x << 13;
@@ -74,13 +76,16 @@ impl Chain for DevChain {
     async fn balance(&mut self) -> Result<Balance> {
         let r = sqlx::query(
             "SELECT (SELECT COALESCE(SUM(amount_zats),0)::bigint FROM dev_incoming) AS inc,
+                    (SELECT COALESCE(SUM(amount_zats),0)::bigint FROM dev_incoming WHERE height > 0 AND height <= $2) AS conf,
                     (SELECT COALESCE(SUM(amount_zats + $1),0)::bigint FROM dev_outgoing) AS out",
         )
         .bind(DEV_FEE_ZATS)
+        .bind(self.now_height() as i32)
         .fetch_one(&self.pool)
         .await?;
-        let total = r.get::<i64, _>("inc") - r.get::<i64, _>("out");
-        Ok(Balance { total_zats: total, spendable_zats: total, transparent_zats: 0 })
+        let out = r.get::<i64, _>("out");
+        let total = r.get::<i64, _>("inc") - out;
+        Ok(Balance { total_zats: total, spendable_zats: r.get::<i64, _>("conf") - out, transparent_zats: 0 })
     }
 
     async fn shield(&mut self) -> Result<Option<String>> {

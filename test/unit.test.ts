@@ -6,12 +6,15 @@ import { after, test } from 'node:test';
 import * as snarkjs from 'snarkjs';
 import { decryptAddr, encryptAddr } from '../src/lib/crypto.js';
 import { MerkleTree } from '../src/notes/tree.js';
-import { requestSignal as serverSignal, withdrawSignal as serverWithdraw } from '../src/notes/spend.js';
+import { convertSignal as serverConvert, requestSignal as serverSignal, withdrawSignal as serverWithdraw } from '../src/notes/spend.js';
+import { cfg, networkProblems } from '../src/config.js';
+import { roundBooks } from '../src/routes/public.js';
+import { createHash } from 'node:crypto';
 import { isTransparent, validPayoutAddress, withdrawalAmounts } from '../src/routes/money.js';
 import { marginOf } from '../src/services/fees.js';
 import { decide } from '../src/treasury/float.js';
 import { chatUsd, requiredMicroUsd, withMarkup, zatsToMicroUsd } from '../src/services/prices.js';
-import { decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
+import { convertSignal, solvePow, decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
 import { buildSpend } from '../sdk/spend';
 import { CIRCUIT, nodeProve } from './helpers/prove.js';
 
@@ -20,7 +23,7 @@ after(async () => {
 });
 
 const seed = new Uint8Array(64).fill(9);
-const keys = deriveKeys(seed);
+const keys = deriveKeys(seed, 'testnet');
 
 test('incremental tree matches bulk load', () => {
   const leaves = Array.from({ length: 37 }, (_, i) => BigInt(i * 7919 + 1));
@@ -31,9 +34,41 @@ test('incremental tree matches bulk load', () => {
   assert.equal(a.root(), b.root());
 });
 
-test('client and server compute the same signals', () => {
+test('client and server compute the same signals; the refund owner and refill amount are bound', () => {
   assert.equal(requestSignal('POST', '/v1/search', '{"q":1}'), serverSignal('POST', '/v1/search', '{"q":1}'));
+  assert.equal(requestSignal('POST', '/v1/search', '{"q":1}', 77n), serverSignal('POST', '/v1/search', '{"q":1}', 77n));
+  assert.notEqual(serverSignal('POST', '/v1/search', '{"q":1}', 77n), serverSignal('POST', '/v1/search', '{"q":1}', 78n)); // can't redirect a refund
   assert.equal(withdrawSignal('ABC', 'utest1x'), serverWithdraw('abc', 'utest1x'));
+  assert.equal(convertSignal('id', 5n, 1_000n), serverConvert('id', 5n, 1_000n));
+  assert.notEqual(serverConvert('id', 5n, 1_000n), serverConvert('id', 5n, 1_001n)); // can't change a refill's amount
+});
+
+test('testnet and mainnet can never be mixed up by configuration', () => {
+  const base = { ...cfg, ZEEP_RECEIVE_UA: '', ZEEP_RESERVE_TADDR: '' };
+  assert.deepEqual(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test' }), []);
+  assert.match(networkProblems({ ...base, ZEEP_ENV: 'mainnet', ZCASH_NETWORK: 'test' }).join(), /needs ZCASH_NETWORK=main/);
+  assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'main' }).join(), /needs ZCASH_NETWORK=test/);
+  // A testnet wallet address on mainnet (or the reverse) is refused.
+  assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test', ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100) }).join(), /ZEEP_RECEIVE_UA/);
+  assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test', ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33) }).join(), /ZEEP_RESERVE_TADDR/);
+  const main = { ...base, ZEEP_ENV: 'mainnet' as const, ZCASH_NETWORK: 'main' as const, PUBLIC_API_BASE_URL: 'https://api.zeep.app' };
+  const p = networkProblems({ ...main, TREASURY_RAILS: 'mock', MPP_MODE: 'mock', SPEND_VKEY_SHA256: '', ALLOW_PRICE_FALLBACK: true, REQUIRE_RELAY: false, ALLOW_NO_RELAY: false }).join();
+  for (const m of [/TREASURY_RAILS=live/, /MPP_MODE=live/, /SPEND_VKEY_SHA256/, /ALLOW_PRICE_FALLBACK/, /REQUIRE_RELAY/]) assert.match(p, m);
+  assert.deepEqual(networkProblems({ ...main, TREASURY_RAILS: 'live', MPP_MODE: 'live', SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
+    ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100), ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33) }), []);
+});
+
+test('public reserve books are rounded so single payments cannot be read off them', () => {
+  assert.deepEqual(roundBooks({ usd: { owed_micro_usd: 12_345_678, coverage_bps: 10_113 }, zec: { notes_zats: 1_499_999 }, zec_usd: 50.12 }),
+    { usd: { owed_micro_usd: 12_000_000, coverage_bps: 10_113 }, zec: { notes_zats: 1_000_000 }, zec_usd: 50.12 });
+});
+
+test('deposit intent proof of work: the SDK solves what the server checks', () => {
+  const id = 'ab'.repeat(32);
+  const nonce = solvePow(id, 12);
+  const h = createHash('sha256').update(`zeep-intent-pow-v1:${id}:${nonce}`).digest();
+  assert.equal(h[0], 0);
+  assert.equal(h[1] >> 4, 0);
 });
 
 test('credits show dollars (1 credit = $1 by default); deposits split 50/50 with the fee only on the converted half', () => {
@@ -81,16 +116,21 @@ test('float: ZEC owed to ZEC notes stays ZEC; only the surplus is converted to U
 });
 
 test('keys and deposit slots are deterministic from the seed', () => {
-  assert.deepEqual(depositSlot(deriveKeys(seed), 3), depositSlot(keys, 3));
+  assert.deepEqual(depositSlot(deriveKeys(seed, 'testnet'), 3), depositSlot(keys, 3));
   assert.notEqual(depositSlot(keys, 3).intentId, depositSlot(keys, 4).intentId);
   assert.notEqual(depositSlot(keys, 3).d, depositSlot(keys, 3).dZec); // the deposit's dollar and ZEC notes
-  assert.notEqual(deriveKeys(new Uint8Array(64).fill(1)).vaultId, keys.vaultId);
+  assert.notEqual(deriveKeys(new Uint8Array(64).fill(1), 'testnet').vaultId, keys.vaultId);
+  // Same phrase, other network: nothing in common.
+  const main = deriveKeys(seed, 'mainnet');
+  assert.notEqual(main.sk, keys.sk);
+  assert.notEqual(main.vaultId, keys.vaultId);
+  assert.notEqual(depositSlot(main, 3).intentId, depositSlot(keys, 3).intentId);
 });
 
 test('note backups decrypt only with the owner key', async () => {
   const e = await encryptNote(keys.noteKey, 123_456n, 42n, ZEC);
   assert.deepEqual(await decryptNote(keys.noteKey, e), { amount: 123_456n, rho: 42n, asset: ZEC });
-  assert.equal(await decryptNote(deriveKeys(new Uint8Array(64).fill(2)).noteKey, e), null);
+  assert.equal(await decryptNote(deriveKeys(new Uint8Array(64).fill(2), 'testnet').noteKey, e), null);
 });
 
 test('note selection: per asset; one note, two notes, or merge first', () => {
@@ -138,4 +178,31 @@ test('a real spend proof verifies; value is conserved; balance stays hidden', { 
   // A dollar note can't be spent as ZEC: its leaf doesn't match an asset-1 commitment.
   await assert.rejects(buildSpend(keys, { asset: ZEC, inputs: [{ ...note, asset: ZEC }], cost: 1n, signal }, paths, nodeProve));
   void zeros;
+});
+
+test('a failed request is refunded, unless Zeep already paid the upstream for it', async () => {
+  const { withCharge } = await import('../src/routes/paid.js');
+  const { chargeCtx } = await import('../src/services/mpp.js');
+  const { errors } = await import('../src/lib/errors.js');
+  const reply = { sent: false, raw: { headersSent: false } } as never;
+  let refunds = 0;
+  const s = { compensate: async () => (refunds++, { tree: 1, indexes: [5], root: '0' }) } as never;
+  // Upstream failed before any payment: the user gets the money back as a new note.
+  await assert.rejects(withCharge(s, reply, async () => { throw errors.busy(); }), (e: { extra?: { compensation?: unknown } }) => !!e.extra?.compensation);
+  assert.equal(refunds, 1);
+  // An MPP credential was signed (Zeep paid), then it failed: not refundable.
+  await assert.rejects(withCharge(s, reply, async () => { chargeCtx.getStore()!.upstreamPaid = true; throw errors.busy(); }), (e: { extra?: { refunded?: boolean } }) => e.extra?.refunded === false);
+  assert.equal(refunds, 1);
+});
+
+test('the SDK refuses a server on another network before sending anything key-derived', async () => {
+  const sent: string[] = [];
+  const fakeFetch = (async (url: string) => {
+    sent.push(String(url));
+    return new Response(JSON.stringify({ network: 'mainnet' }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const { ZeepClient: Client } = await import('../sdk/client');
+  const c = new Client({ baseUrl: 'https://api.example', keys, book: new NoteBook(), prove: nodeProve, fetch: fakeFetch });
+  await assert.rejects(c.depositStatus(0), /on mainnet, but these keys are for testnet/);
+  assert.deepEqual(sent, ['https://api.example/v1/config']); // the intent id never left the device
 });

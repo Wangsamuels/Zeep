@@ -7,6 +7,8 @@ import { nullifierOf, decryptNote, encryptNote, noteFromKeys, NoteBook, ownerTag
 import { depositSlot, type ZeepKeys } from "./keys";
 import { convertSignal, depositSignal, notesSignal, randomField, requestSignal, withdrawSignal } from "./field";
 import { bpsOf, zatsToMicroUsd } from "./units";
+import { sha256 } from "@noble/hashes/sha256";
+import { utf8ToBytes } from "@noble/hashes/utils";
 import { buildSpend, DEPTH, TAG, type Paths, type ProveFn } from "./spend";
 import { MerkleTree } from "./tree";
 
@@ -82,6 +84,7 @@ export class ZeepClient {
   private f: typeof fetch;
   private busy: Promise<unknown> = Promise.resolve();
   private conf: any;
+  private verified = false;
 
   constructor(private o: ClientOptions) {
     this.keys = o.keys;
@@ -110,6 +113,9 @@ export class ZeepClient {
 
   // ---------------------------------------------------------------- http
   async api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+    // Nothing that carries a key-derived value (intent ids, vault id, proofs) is sent until the
+    // server has confirmed it is on the same network as the keys.
+    if (!this.verified && path !== "/v1/config") await this.config();
     const res = await this.f(`${this.base}${path}`, { credentials: "omit", referrerPolicy: "no-referrer", cache: "no-store", ...init });
     const text = await res.text();
     let body: any = null;
@@ -129,7 +135,12 @@ export class ZeepClient {
   }
 
   async config() {
-    this.conf = await this.api<any>("/v1/config");
+    const c = await this.api<any>("/v1/config");
+    if (c?.network !== this.keys.network) {
+      throw new ZeepApiError(`This server is on ${c?.network}, but these keys are for ${this.keys.network}.`, 0, "wrong_network", c);
+    }
+    this.conf = c;
+    this.verified = true;
     return this.conf;
   }
   prices() {
@@ -287,19 +298,20 @@ export class ZeepClient {
       const id = crypto.randomUUID();
       const rho = randomField();
       const d = ownerTag(this.keys.pk, rho);
-      const built = await buildSpend(this.keys, { asset: ZEC, inputs, cost: zats, signal: convertSignal(id, d) }, this.paths(current), this.o.prove);
-      delete built.bundle.compensate;
       const px = (await this.prices()).zec_usd as number;
       const value = zatsToMicroUsd(zats, px);
       let amount = value - bpsOf(value, feeBps);
       for (let attempt = 0; ; attempt++) {
+        // The proof binds the new note's amount, so a changed amount needs a new proof.
+        const built = await buildSpend(this.keys, { asset: ZEC, inputs, cost: zats, signal: convertSignal(id, d, BigInt(amount)) }, this.paths(current), this.o.prove);
+        delete built.bundle.compensate;
         const e = await encryptNote(this.keys.noteKey, BigInt(amount), rho, USD);
         const res = await this.f(`${this.base}/v1/convert/to-usd`, this.json("POST", {
           conversion_id: id, mint: { d: d.toString(), e, amount_micro_usd: amount }, proof: built.bundle,
         }));
         const body = await res.json().catch(() => null);
         if (res.status === 409 && body?.error?.code === "price_moved" && attempt < 2) {
-          amount = body.error.amount_micro_usd; // the live quote; the same proof is still valid
+          amount = body.error.amount_micro_usd; // the live quote (nothing was spent)
           continue;
         }
         if (!res.ok) {
@@ -326,7 +338,9 @@ export class ZeepClient {
       await this.ensureUsd(costMicroUsd);
       const { inputs, current } = await this.prepare(costMicroUsd, USD);
       try {
-        const built = await buildSpend(this.keys, { asset: USD, inputs, cost: costMicroUsd, signal: requestSignal(method, path, body) }, this.paths(current), this.o.prove);
+        const refundRho = randomField();
+        const signal = requestSignal(method, path, body, ownerTag(this.keys.pk, refundRho));
+        const built = await buildSpend(this.keys, { asset: USD, inputs, cost: costMicroUsd, signal, refundRho }, this.paths(current), this.o.prove);
         const headers: Record<string, string> = { "content-type": "application/json", ...extraHeaders };
         const b64 = b64json(built.bundle);
         for (let i = 0, n = 0; i < b64.length; i += 7000, n++) headers[n ? `x-zeep-proof-${n}` : "x-zeep-proof"] = b64.slice(i, i + 7000);
@@ -386,8 +400,10 @@ export class ZeepClient {
       delete built.bundle.compensate;
       proof = built.bundle;
     }
+    const bits: number = (this.conf ?? (await this.config())).deposits.pow_bits ?? 0;
     const st = await this.api<DepositStatus>("/v1/deposits", this.json("POST", {
       intent_id: intentId, d: d.toString(), d_zec: dZec.toString(), expected_zats: expectedZats ? Number(expectedZats) : undefined, claim_from: claimFrom, proof,
+      pow: bits > 0 ? solvePow(intentId, bits) : undefined,
     }));
     this.book.nextDeposit = slot + 1;
     await this.changed();
@@ -397,7 +413,7 @@ export class ZeepClient {
   /** Poll a deposit; adds its two notes to the book when it lands (and resets the refill stages). */
   async depositStatus(slot: number): Promise<DepositStatus> {
     const { intentId, rho, rhoZec } = depositSlot(this.keys, slot);
-    const st = await this.api<DepositStatus>(`/v1/deposits/${intentId}`);
+    const st = await this.api<DepositStatus>("/v1/deposits/status", this.json("POST", { intent_id: intentId }));
     const c = st.credited;
     if (c) {
       const usd = noteFromKeys(this.keys, rho, BigInt(c.usd.amount_micro_usd), USD, c.tree, c.usd.index, `deposit:${slot}`);
@@ -453,20 +469,22 @@ export class ZeepClient {
       const id = crypto.randomUUID();
       const signal = withdrawSignal(id, payoutAddress);
       const locked: Note[] = [];
+      // Today's withdrawal tag goes on the larger part (covered network fees need it to move ≥ $1).
+      const px = (await this.prices()).zec_usd as number;
+      const tagOnZec = plan.zecZats > 0n && (plan.usdMicro === 0n || BigInt(zatsToMicroUsd(plan.zecZats, px)) >= plan.usdMicro);
       try {
         let zecSpend: { built: Awaited<ReturnType<typeof buildSpend>>; inputs: Note[] } | undefined;
         let usdSpend: typeof zecSpend;
         if (plan.zecZats > 0n) {
           const { inputs, current } = await this.prepare(plan.zecZats, ZEC);
           locked.push(...inputs);
-          const built = await buildSpend(this.keys, { asset: ZEC, inputs, cost: plan.zecZats, signal, daily: TAG.withdrawal }, this.paths(current), this.o.prove);
+          const built = await buildSpend(this.keys, { asset: ZEC, inputs, cost: plan.zecZats, signal, daily: tagOnZec ? TAG.withdrawal : undefined }, this.paths(current), this.o.prove);
           zecSpend = { built, inputs };
         }
         if (plan.usdMicro > 0n) {
           const { inputs, current } = await this.prepare(plan.usdMicro, USD);
           locked.push(...inputs);
-          // Only the first proof carries today's withdrawal tag.
-          const built = await buildSpend(this.keys, { asset: USD, inputs, cost: plan.usdMicro, signal, daily: zecSpend ? undefined : TAG.withdrawal }, this.paths(current), this.o.prove);
+          const built = await buildSpend(this.keys, { asset: USD, inputs, cost: plan.usdMicro, signal, daily: tagOnZec ? undefined : TAG.withdrawal }, this.paths(current), this.o.prove);
           usdSpend = { built, inputs };
         }
         if (!zecSpend && !usdSpend) throw new Error("nothing to withdraw");
@@ -491,7 +509,7 @@ export class ZeepClient {
   }
 
   withdrawalStatus(id: string) {
-    return this.api<any>(`/v1/withdrawals/${id}`);
+    return this.api<any>("/v1/withdrawals/status", this.json("POST", { withdrawal_id: id }));
   }
 
   // ---------------------------------------------------------------- restore / sync
@@ -499,13 +517,18 @@ export class ZeepClient {
   async refreshSpent(): Promise<void> {
     const mine = this.book.notes.filter((n) => !n.spent);
     if (!mine.length) return;
-    const real = mine.map((n) => nullifierOf(this.keys.sk, BigInt(n.rho)).toString());
-    const decoys = Array.from({ length: Math.max(8, real.length) }, () => randomField().toString());
-    const all = [...real, ...decoys].sort(() => Math.random() - 0.5);
-    const r = await this.api<{ spent: boolean[] }>("/v1/nullifiers/check", this.json("POST", { nullifiers: all }));
-    const spent = new Set(all.filter((_, i) => r.spent[i]));
+    // Ask only for buckets (top bits) and check locally: the server never sees our nullifiers.
+    const bits: number = (this.conf ?? (await this.config())).nullifier_bucket_bits;
+    const real = mine.map((n) => nullifierOf(this.keys.sk, BigInt(n.rho)));
+    const bucketOf = (x: bigint) => Number(x >> BigInt(254 - bits));
+    const buckets = [...new Set(real.map(bucketOf))];
+    const spent = new Set<string>();
+    for (let i = 0; i < buckets.length; i += 64) {
+      const r = await this.api<{ spent: Record<string, string[]> }>("/v1/nullifiers/buckets", this.json("POST", { buckets: buckets.slice(i, i + 64) }));
+      for (const list of Object.values(r.spent)) list.forEach((x) => spent.add(x));
+    }
     mine.forEach((n, i) => {
-      if (spent.has(real[i])) n.spent = true;
+      if (spent.has(real[i].toString())) n.spent = true;
     });
     await this.changed();
   }
@@ -546,6 +569,27 @@ export class ZeepClient {
     if (this.book.refill.base === "0") this.book.refill = { base: this.book.balance(USD).toString(), stage: 0 };
     await this.changed();
     return this.book.balance(USD);
+  }
+}
+
+/** Anti-spam proof of work for a deposit intent (~65k hashes at 16 bits; well under a second). */
+export function solvePow(intentId: string, bits: number): string {
+  for (let n = 0; ; n++) {
+    const nonce = n.toString(16);
+    const h = sha256(utf8ToBytes(`zeep-intent-pow-v1:${intentId}:${nonce}`));
+    let need = bits;
+    let ok = true;
+    for (const byte of h) {
+      if (need <= 0) break;
+      if (need >= 8) {
+        if (byte !== 0) { ok = false; break; }
+        need -= 8;
+      } else {
+        if (byte >> (8 - need) !== 0) ok = false;
+        break;
+      }
+    }
+    if (ok) return nonce;
   }
 }
 

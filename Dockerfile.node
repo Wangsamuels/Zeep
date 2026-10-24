@@ -14,5 +14,7 @@ COPY package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY migrations ./migrations
+# The spend verifying key (SPEND_VKEY_PATH=circuits/zeep_spend_vkey.json, pinned by SPEND_VKEY_SHA256).
+COPY circuits/zeep_spend_vkey.json ./circuits/zeep_spend_vkey.json
 USER node
 CMD ["node", "dist/server.js"]

@@ -42,6 +42,13 @@ pub struct Config {
 
     pub payout_addr_enc_key: Option<String>,
 
+    /// Light client: lightwalletd servers to use, in order (LIGHTWALLETD_URL, comma-separated).
+    pub lightwalletd_urls: Vec<String>,
+    /// Light client: the reserve wallet's 24 recovery words (ZEEP_WALLET_SEED).
+    pub wallet_seed: Option<String>,
+    /// ZEEP_RESERVE_TADDR, checked against the seed so NEAR Intents returns ZEC to this wallet.
+    pub reserve_taddr: Option<String>,
+
     pub wallet_rpc_url: Option<String>,
     pub wallet_rpc_user: Option<String>,
     pub wallet_rpc_password: Option<String>,
@@ -62,15 +69,37 @@ impl Config {
             other => bail!("unknown CHAIN_BACKEND {other}"),
         };
         let zeep_env = var("ZEEP_ENV").unwrap_or_else(|| "testnet".into());
-        if backend == Backend::Dev && zeep_env == "mainnet" {
+        let network = var("ZCASH_NETWORK").unwrap_or_else(|| "test".into());
+        let mainnet = match zeep_env.as_str() {
+            "mainnet" => true,
+            "testnet" => false,
+            other => bail!("unknown ZEEP_ENV {other}"),
+        };
+        if mainnet != (network == "main") || !(network == "main" || network == "test") {
+            bail!("ZEEP_ENV={zeep_env} needs ZCASH_NETWORK={}", if mainnet { "main" } else { "test" });
+        }
+        // The dev chain on mainnet settings is only for the end-to-end tests.
+        let simulation = var("ZEEP_TEST_SIMULATION").as_deref() == Some("1");
+        if simulation && (var("DYNO").is_some() || var("NODE_ENV").as_deref() != Some("test")) {
+            bail!("ZEEP_TEST_SIMULATION is for local tests only");
+        }
+        if backend == Backend::Dev && mainnet && !simulation {
             bail!("CHAIN_BACKEND=dev is not allowed with ZEEP_ENV=mainnet");
         }
         let receive_ua = var("ZEEP_RECEIVE_UA").unwrap_or_default();
+        let ua_prefix = if mainnet { "u1" } else { "utest1" };
+        for (name, ua) in [("ZEEP_RECEIVE_UA", Some(receive_ua.clone())), ("ZEEP_RESERVE_UA", var("ZEEP_RESERVE_UA"))] {
+            if let Some(ua) = ua.filter(|u| !u.is_empty()) {
+                if !ua.starts_with(ua_prefix) || (mainnet && ua.starts_with("utest1")) {
+                    bail!("{name} is not a {network}net unified address");
+                }
+            }
+        }
         Ok(Self {
             database_url: var("DATABASE_URL").unwrap_or_else(|| "postgres://localhost:5432/zeep".into()),
             redis_url: var("REDIS_URL").unwrap_or_else(|| "redis://localhost:6379".into()),
             zeep_env,
-            network: var("ZCASH_NETWORK").unwrap_or_else(|| "test".into()),
+            network,
             backend,
             reserve_ua: var("ZEEP_RESERVE_UA").unwrap_or_else(|| receive_ua.clone()),
             receive_ua,
@@ -81,14 +110,25 @@ impl Config {
             address_pool_min: or("ADDRESS_POOL_MIN", 25)?,
             shield_min_zats: or("SHIELD_MIN_ZATS", 100_000)?,
             payout_addr_enc_key: var("PAYOUT_ADDR_ENC_KEY"),
+            lightwalletd_urls: var("LIGHTWALLETD_URL")
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default(),
+            wallet_seed: var("ZEEP_WALLET_SEED"),
+            reserve_taddr: var("ZEEP_RESERVE_TADDR"),
             wallet_rpc_url: var("WALLET_RPC_URL"),
             wallet_rpc_user: var("WALLET_RPC_USER"),
             wallet_rpc_password: var("WALLET_RPC_PASSWORD"),
-            wallet_privacy_policy: var("WALLET_PRIVACY_POLICY").unwrap_or_else(|| "AllowRevealedAmounts".into()),
+            // FullPrivacy first; payouts fall back to AllowRevealedAmounts only when a send needs to
+            // cross pools (e.g. to a Sapling-only address). See chain/rpc.rs send().
+            wallet_privacy_policy: var("WALLET_PRIVACY_POLICY").unwrap_or_else(|| "FullPrivacy".into()),
             dev_genesis_unix: or("DEV_GENESIS_UNIX", 1_760_000_000)?,
             dev_block_secs: or("DEV_BLOCK_SECS", 75)?,
             poll_secs: or("POLL_SECS", 0)?,
         })
     }
 
+    /// Redis namespace shared with the Node processes (`zeep:<ZEEP_ENV>`).
+    pub fn ns(&self) -> String {
+        format!("zeep:{}", self.zeep_env)
+    }
 }

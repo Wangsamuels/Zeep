@@ -5,6 +5,13 @@
 -- Users hold shielded notes; the server sees note commitments, nullifiers and the
 -- public cost of each spend, never who spent or what is left.
 
+-- Which network this database belongs to ('testnet' / 'mainnet'). Stamped on the first
+-- migrate; every process refuses to start if it doesn't match ZEEP_ENV.
+CREATE TABLE meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+
 -- Note trees: 2^20 leaves each; when one fills, the next opens. Closed trees keep
 -- their final root so old notes stay spendable forever.
 CREATE TABLE trees (
@@ -20,7 +27,7 @@ CREATE TABLE notes (
   leaf_index  INT NOT NULL,
   commitment  NUMERIC(78,0) NOT NULL,          -- Poseidon(d, amount, asset): 0 micro-USD, 1 zats
   enc         TEXT,                            -- client-encrypted note backup (only its owner can read it)
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at  DATE NOT NULL DEFAULT CURRENT_DATE,  -- day only: can't be matched to a request's time
   PRIMARY KEY (tree_id, leaf_index)
 );
 
@@ -32,6 +39,7 @@ CREATE TABLE roots (
   PRIMARY KEY (tree_id, root)
 );
 CREATE INDEX roots_recent_idx ON roots (tree_id, created_at DESC);
+CREATE INDEX roots_root_idx ON roots (root);
 
 -- Spent notes. Kept forever: a nullifier must never be accepted twice.
 CREATE TABLE nullifiers (
@@ -138,9 +146,10 @@ CREATE TABLE conversions (
   id               BIGSERIAL PRIMARY KEY,
   direction        TEXT NOT NULL CHECK (direction IN ('to_tempo', 'to_zec')),
   reason           TEXT NOT NULL,                  -- surplus (dollar half of deposits, refills) | withdrawal
-  step             TEXT NOT NULL,                  -- see src/treasury/float.ts
+  step             TEXT NOT NULL,                  -- see src/treasury/float.ts (*_starting / paying_base: money in flight)
   zec_zats         BIGINT,                         -- ZEC sent (to_tempo) or received (to_zec)
   usdc_units       BIGINT,                         -- USDC (6 dp) received (to_tempo) or sent (to_zec)
+  usdc_out         BIGINT,                         -- USDC the Relay bridge delivers (exact input minus its fee)
   zec_usd          NUMERIC(18,6) NOT NULL,         -- price when started
   oneclick_deposit TEXT,
   payout_id        BIGINT REFERENCES payouts(id),
@@ -218,6 +227,16 @@ CREATE TABLE vault_items (
   PRIMARY KEY (vault_id, item_id)
 );
 CREATE INDEX vault_items_expiry_idx ON vault_items (expires_at) WHERE expires_at IS NOT NULL;
+
+-- Light client (CHAIN_BACKEND=lightclient): the reserve wallet's SQLite file, saved by the
+-- wallet dyno after every change and restored on boot. Holds no keys (the seed is a config
+-- var), but does hold the reserve's transaction history: treat it as private.
+CREATE TABLE wallet_store (
+  network         TEXT PRIMARY KEY,               -- 'testnet' / 'mainnet'
+  data            BYTEA NOT NULL,
+  scanned_height  INT,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE wallet_state (
   id                     SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),

@@ -1,0 +1,17 @@
+# One Worker per network. Deploy with:  npx wrangler deploy --env testnet   (or --env mainnet)
+name = "zeep-relay"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# No request logs at Cloudflare's Workers layer for this script.
+[observability]
+enabled = false
+
+[env.testnet]
+name = "zeep-relay-testnet"
+vars = { ORIGIN = "https://REPLACE-zeep-test.herokuapp.com" }
+
+[env.mainnet]
+name = "zeep-relay-mainnet"
+vars = { ORIGIN = "https://REPLACE-zeep-main.herokuapp.com" }

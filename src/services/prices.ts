@@ -1,15 +1,19 @@
-// Prices are in USD and charged in micro-USD (balances are dollars). The live ZEC price is
-// used only to credit ZEC deposits and to estimate withdrawals.
+// Prices are in USD and charged in micro-USD. The live ZEC price values ZEC notes for display
+// and sets the rate of every ZEC ⇄ dollar conversion (deposits' dollar half, refills,
+// withdrawal estimates).
 //
 // ZEC/USD comes from the NEAR Intents 1Click token list (the same venue the treasury
-// sells on), refreshed every PRICE_REFRESH_SEC, with ZEC_USD_FALLBACK when unavailable.
+// sells on). Display uses a quote up to PRICE_REFRESH_SEC old, falling back to
+// ZEC_USD_FALLBACK. Money operations use moneyQuote(): live and at most PRICE_MAX_AGE_SEC
+// old, never the fallback (unless ALLOW_PRICE_FALLBACK on testnet).
 import { OneClickService, OpenAPI } from '@defuse-protocol/one-click-sdk-typescript';
 import { cfg, models, type ModelInfo } from '../config.js';
-import { errors } from '../lib/errors.js';
+import { errors, ZeepError } from '../lib/errors.js';
 import { log } from '../lib/log.js';
-import { redis } from '../lib/redis.js';
+import { q } from '../lib/db.js';
+import { keys, redis } from '../lib/redis.js';
 
-const KEY = 'zeep:price:zec';
+const KEY = keys.price;
 
 interface Quote {
   usd: number;
@@ -18,23 +22,57 @@ interface Quote {
 }
 let cache: { current: Quote; previous: Quote | null; fetchedAt: number } | undefined;
 
-async function fetchZecUsd(): Promise<Quote> {
-  if (cfg.MPP_MODE === 'mock' || !cfg.NEAR_ONECLICK_JWT) {
-    return { usd: cfg.ZEC_USD_FALLBACK, at: new Date().toISOString(), source: 'fallback' };
+/**
+ * The fallback price updates itself: every live quote is saved in Postgres (meta.last_zec_usd),
+ * and when 1Click is unreachable the last live price is used. ZEC_USD_FALLBACK is only the
+ * starting value before the first live quote ever. (Money still never moves at a fallback
+ * price on mainnet; see moneyQuote.)
+ */
+async function lastLiveUsd(): Promise<number> {
+  try {
+    const r = await q<{ value: string }>(`SELECT value FROM meta WHERE key = 'last_zec_usd'`);
+    const v = r[0] ? Number(JSON.parse(r[0].value).usd) : NaN;
+    return v > 0 ? v : cfg.ZEC_USD_FALLBACK;
+  } catch {
+    return cfg.ZEC_USD_FALLBACK;
   }
+}
+async function saveLiveUsd(usd: number, at: string): Promise<void> {
+  await q(`INSERT INTO meta (key, value) VALUES ('last_zec_usd', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [JSON.stringify({ usd, at })]).catch(() => {});
+}
+const fallbackQuote = async (): Promise<Quote> => ({ usd: await lastLiveUsd(), at: new Date().toISOString(), source: 'fallback' });
+
+async function fetchZecUsd(): Promise<Quote> {
+  if (!cfg.NEAR_ONECLICK_JWT) return fallbackQuote();
   try {
     OpenAPI.BASE = cfg.NEAR_ONECLICK_BASE_URL;
     OpenAPI.TOKEN = cfg.NEAR_ONECLICK_JWT;
-    const tokens = (await OneClickService.getTokens()) as Array<{ symbol?: string; blockchain?: string; price?: number | string }>;
+    const tokens = (await Promise.race([
+      OneClickService.getTokens(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('1Click token list timed out')), 8_000)),
+    ])) as Array<{ symbol?: string; blockchain?: string; price?: number | string }>;
     const zec = tokens.find((t) => t.symbol?.toUpperCase() === 'ZEC' && (t.blockchain ?? '').toLowerCase().includes('zec'))
       ?? tokens.find((t) => t.symbol?.toUpperCase() === 'ZEC');
     const usd = Number(zec?.price);
     if (!(usd > 0)) throw new Error('no ZEC price in token list');
-    return { usd, at: new Date().toISOString(), source: 'near-intents' };
+    const at = new Date().toISOString();
+    await saveLiveUsd(usd, at);
+    return { usd, at, source: 'near-intents' };
   } catch (e) {
-    log.warn({ err: (e as Error).message }, 'ZEC price fetch failed; using fallback');
-    return { usd: cfg.ZEC_USD_FALLBACK, at: new Date().toISOString(), source: 'fallback' };
+    log.warn({ err: (e as Error).message }, 'ZEC price fetch failed; using the last live price');
+    return fallbackQuote();
   }
+}
+
+/** Treasury job: refresh the shared quote every PRICE_REFRESH_SEC so it never goes stale. */
+export async function refreshPrice(): Promise<Quote> {
+  const fresh = await fetchZecUsd();
+  const prev = cache?.current ?? null;
+  const stored = { current: fresh, previous: prev };
+  await redis.set(KEY, JSON.stringify(stored), 'EX', 24 * 3600).catch(() => {});
+  cache = { ...stored, fetchedAt: Date.now() };
+  return fresh;
 }
 
 /** Current and previous ZEC/USD quotes, shared across dynos through Redis. */
@@ -55,6 +93,28 @@ export async function zecQuotes(): Promise<{ current: Quote; previous: Quote | n
   }
   cache = { ...stored!, fetchedAt: Date.now() };
   return cache;
+}
+
+/**
+ * The quote money moves at. Throws 503 price_unavailable when no live quote can be had, so
+ * nothing is credited or converted at a made-up or stale price (callers retry later).
+ */
+export async function moneyQuote(): Promise<Quote> {
+  let q = (await zecQuotes()).current;
+  if (Date.now() - Date.parse(q.at) > cfg.PRICE_MAX_AGE_SEC * 1000 || q.source === 'fallback') {
+    const fresh = await fetchZecUsd();
+    if (fresh.source !== 'fallback') {
+      const stored = { current: fresh, previous: q };
+      await redis.set(KEY, JSON.stringify(stored), 'EX', 24 * 3600).catch(() => {});
+      cache = { ...stored, fetchedAt: Date.now() };
+    }
+    q = fresh;
+  }
+  // Testnet ZEC has no real value, so testnet may run on the fallback price; mainnet never.
+  if (q.source === 'fallback' && !(cfg.ZEEP_ENV === 'testnet' || cfg.ALLOW_PRICE_FALLBACK)) {
+    throw new ZeepError(503, 'price_unavailable', 'the ZEC price is unavailable right now; try again in a minute');
+  }
+  return q;
 }
 
 export const usdToZats = (usd: number, zecUsd: number): number => Math.ceil((usd * 1e8) / zecUsd);
