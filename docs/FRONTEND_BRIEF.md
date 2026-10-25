@@ -11,6 +11,34 @@ The treasury side (USDC.e on Tempo, the EVM wallet, bridges) is run by Zeep. **N
 
 The reference client is in the backend repo at `sdk/`. It is plain TypeScript that works in the browser, so copy it into the frontend; don't rewrite it. The backend end-to-end tests drive it through deposit → pay → withdraw → restore, so it is known to work against the API.
 
+## 0. Do this first: re-sync `lib/zeep/` with the backend `sdk/` (the live testnet needs it)
+
+The copy in `Zeep-front/lib/zeep/` is an **older SDK version**, and the deployed testnet backend rejects it. The deposit page shows `missing or insufficient proof of work (pow)` (HTTP 400 from `POST /v1/deposits`). Paid requests, conversions and status polling will fail next.
+
+**What's out of date in the old copy**
+
+| Old copy in `lib/zeep/` | Backend `sdk/` (current) |
+| --- | --- |
+| `POST /v1/deposits` sends no `pow` | Reads `deposits.pow_bits` from `GET /v1/config`, solves `solvePow(intentId, bits)` (about 1 s at 16 bits) and sends `pow` |
+| `GET /v1/deposits/:id` (removed from the API) | `POST /v1/deposits/status` with `{ intent_id }`; withdrawals use `POST /v1/withdrawals/status` likewise |
+| `requestSignal` uses `zeep-req-v1` | `zeep-req-v2`, which also binds `refundD`; otherwise every paid request fails proof verification |
+| `convertSignal` uses `zeep-convert-v1` (id, mintD) | `zeep-convert-v2`, which also binds the amount; on `price_moved` it re-proves |
+| Keys don't depend on the network | `deriveKeys(seed, network)`, so `ZeepKeys.network` is set and the client refuses a server on the other network |
+| Spent check per nullifier | Bucketed check: `POST /v1/nullifiers/buckets`, using `nullifier_bucket_bits` from config |
+| Withdrawal tag | Goes on the larger of the two proofs, which must move at least `FREE_FEE_MIN` |
+
+**How to sync**
+
+1. Copy **every file** from the backend `sdk/` over `lib/zeep/`: `client.ts`, `field.ts`, `index.ts`, `keys.ts`, `notes.ts`, `spend.ts`, `tree.ts`, `units.ts`.
+2. Keep the frontend-only files (`pay.ts`, `prices.ts`, `prove.ts`). Fix their imports or types if the copied files changed them. Don't edit the copied SDK files to suit them.
+3. Pass the active network into `deriveKeys`/`ZeepClient` (see §2c). Existing 24-word phrases still work, but they now give different keys. That's fine on testnet because no funds are on it yet; users just sign in again.
+4. Check that all of these pass:
+   - `grep -rn "zeep-req-v1\|zeep-convert-v1\|/v1/deposits/\${" lib/` finds nothing;
+   - `npm run build` passes;
+   - the deposit page creates an address on the testnet relay.
+
+After this, re-copy `sdk/` whenever the backend changes it (the backend commit message will say "SDK").
+
 ---
 
 ## 1. Remove the old model
