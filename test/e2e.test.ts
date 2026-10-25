@@ -393,6 +393,46 @@ test('reserve: ZEC held covers ZEC owed, dollars held cover dollars owed, and th
   assert.equal(pub.zec.owed_zats % 1_000_000, 0); // and 0.01 ZEC
 });
 
+test('testnet on a real chain: credits convert back from the reserve (simulated rails), no ZEC sent to fake addresses', { timeout: 180_000 }, async () => {
+  const c = cfg as { CHAIN_BACKEND: string };
+  const saved = c.CHAIN_BACKEND;
+  const d = await alice.startDeposit(20_000_000n);
+  await payInto(d.address, 20_000_000);
+  await until(async () => !!(await alice.depositStatus(d.slot)).credited);
+  c.CHAIN_BACKEND = 'lightclient'; // what Heroku testnet runs
+  try {
+    // An older build's surplus conversion to a fake rails address gets cancelled, not sent.
+    const [pay] = await q<{ id: string }>(`INSERT INTO payouts (kind, dest_address, amount_zats, scheduled_at) VALUES ('conversion', 'tmMockDeposit1', 1000, now() + interval '1 day') RETURNING id`);
+    await q(`INSERT INTO conversions (direction, reason, step, zec_zats, zec_usd, oneclick_deposit, payout_id) VALUES ('to_tempo','surplus','zec_sending',1000,50,'tmMockDeposit1',$1)`, [pay.id]);
+    const open0 = await q(`SELECT 1 FROM conversions WHERE direction = 'to_tempo' AND step NOT IN ('done','failed')`);
+    assert.equal(open0.length, 1);
+
+    const before = alice.balances();
+    const p = await alice.planWithdrawal(before.zec + 2_000_000n); // needs credits converted back
+    assert.equal(p.needsConversion, true);
+    const w = await alice.withdraw(p, SAPLING);
+    assert.equal(w.status, 'converting');
+    await floatTick();
+
+    assert.equal((await q(`SELECT 1 FROM conversions WHERE direction = 'to_tempo' AND step NOT IN ('done','failed')`)).length, 0);
+    const [po] = await q<{ status: string }>('SELECT status FROM payouts WHERE id = $1', [pay.id]);
+    assert.equal(po.status, 'failed'); // never sent to the fake address
+    const st = await alice.withdrawalStatus(w.withdrawal_id);
+    assert.equal(st.status, 'scheduled'); // converted at once from the reserve
+    const [conv] = await q<{ step: string; relay_request: string }>('SELECT step, relay_request FROM conversions WHERE withdrawal_id = $1', [w.withdrawal_id]);
+    assert.deepEqual(conv, { step: 'done', relay_request: 'testnet-simulated' });
+    const expected = ((Number(p.usdMicro) - w.conversion_fee_micro_usd) / 1e6 / 50) * 1e8 * 0.99;
+    assert.ok(Math.abs(st.zec_received_zats - expected) <= 2, `${st.zec_received_zats} vs ${expected}`);
+    await floatTick(); // idempotent: nothing booked twice
+    assert.equal((await q('SELECT 1 FROM conversions WHERE withdrawal_id = $1', [w.withdrawal_id])).length, 1);
+    c.CHAIN_BACKEND = saved;
+    await sleep(1500);
+    await payOut(w.withdrawal_id);
+  } finally {
+    c.CHAIN_BACKEND = saved;
+  }
+});
+
 test('anonymous inbox: create, list, read the full letter, send, reply, delete; id never in a URL', { timeout: 120_000 }, async () => {
   const prices = await alice.prices();
   const sendCost = BigInt(prices.routes.inbox_send.micro_usd);

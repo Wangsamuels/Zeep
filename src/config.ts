@@ -207,6 +207,9 @@ const Env = z.object({
     z.record(z.string(), z.string()),
     '{"ethereum":"{alchemy}/eth-mainnet","base":"{alchemy}/base-mainnet","arbitrum":"{alchemy}/arb-mainnet","solana":"{quicknode}/solana-mainnet"}',
   ),
+  // Which chain backend the Rust workers use. With mock rails on a REAL chain (testnet light
+  // client), the treasury simulates conversions in its books and never sends ZEC to fake rails.
+  CHAIN_BACKEND: z.enum(['dev', 'rpc', 'lightclient']).default('dev'),
   INBOX_PROVIDER: z.enum(['agentmail', 'stableemail']).default('agentmail'),
   // Anti-abuse limits per inbox (sending costs money and reputation; reads cost Zeep MPP fees).
   INBOX_SENDS_PER_DAY: int(20),

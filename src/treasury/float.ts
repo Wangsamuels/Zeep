@@ -41,6 +41,7 @@ export function decide(i: FloatInputs): FloatAction {
 /** One float tick: convert new deposits, start conversions for new withdrawals, advance all. */
 export async function floatTick(): Promise<FloatAction> {
   if (cfg.FLOAT_MODE !== 'auto') return { action: 'none', why: 'FLOAT_MODE=off' };
+  if (simulatedOnRealChain()) return simulatedTick();
   const r = rails();
   const { tempoUsdc, baseUsdc } = await r.balances();
   await q('UPDATE float_state SET tempo_usdc = $1, base_usdc = $2, updated_at = now() WHERE id = 1', [tempoUsdc.toString(), baseUsdc.toString()]);
@@ -104,6 +105,55 @@ export async function floatTick(): Promise<FloatAction> {
 
   await advance();
   return a;
+}
+
+/** Mock rails on a real chain (testnet + light client): nothing can really be swapped or bridged. */
+export const simulatedOnRealChain = () => cfg.TREASURY_RAILS === 'mock' && cfg.CHAIN_BACKEND !== 'dev';
+const SIM_COST_BPS = 100; // same 1% the mock rails charge (fees + slippage)
+
+/**
+ * Testnet float. The ZEC half of every deposit stays in the reserve wallet (testnet ZEC has no
+ * dollar value to protect), so:
+ *  - surplus ZEC is never sent anywhere (the mock rails' deposit addresses aren't real), and
+ *  - a withdrawal that converts credits is paid from that reserve ZEC at the live price minus
+ *    1%, booked as a finished conversion, and its two tranches are scheduled at once.
+ */
+async function simulatedTick(): Promise<FloatAction> {
+  // Clean up anything an older build started against fake rails.
+  const bogus = await q<{ payout_id: string | null }>(
+    `UPDATE conversions SET step = 'failed', error = 'testnet: simulated rails never send ZEC', updated_at = now()
+      WHERE direction = 'to_tempo' AND step NOT IN ('done','failed') RETURNING payout_id`);
+  const ids = bogus.map((b) => b.payout_id).filter((x): x is string => x !== null);
+  if (ids.length) {
+    await q(`UPDATE payouts SET status = 'failed', last_error = 'testnet: simulated rails' WHERE id = ANY($1::bigint[]) AND status IN ('scheduled','stuck')`, [ids]);
+    log.warn({ conversions: ids.length }, 'testnet: cancelled surplus conversions to simulated rails');
+  }
+
+  const waiting = await q<{ id: string; convert_micro_usd: string; zec_zats: string; network_fee_zats: string }>(
+    `SELECT w.id, w.convert_micro_usd, w.zec_zats, w.network_fee_zats FROM withdrawals w
+      WHERE w.status = 'converting'
+        AND NOT EXISTS (SELECT 1 FROM conversions c WHERE c.withdrawal_id = w.id AND c.step = 'done')
+      ORDER BY w.created_at LIMIT 20`);
+  if (!waiting.length) return { action: 'none', why: 'testnet: simulated rails' };
+  const px = (await moneyQuote().catch(() => null))?.usd;
+  if (px === undefined) return { action: 'none', why: 'no live ZEC price' };
+  for (const wd of waiting) {
+    const usdc = BigInt(wd.convert_micro_usd);
+    const received = Math.floor(((Number(usdc) / 1e6 / px) * 1e8 * (10_000 - SIM_COST_BPS)) / 10_000);
+    await tx(async (db) => {
+      // Older builds may have left a half-finished attempt: close it, then book the simulated one.
+      await db.query(`UPDATE conversions SET step = 'failed', error = 'testnet: replaced by simulated conversion', updated_at = now()
+                       WHERE withdrawal_id = $1 AND step <> 'done'`, [wd.id]);
+      await db.query(
+        `INSERT INTO conversions (direction, reason, step, usdc_units, usdc_out, zec_zats, zec_usd, withdrawal_id, relay_request)
+         VALUES ('to_zec', 'withdrawal', 'done', $1, $1, $2, $3, $4, 'testnet-simulated')`,
+        [usdc.toString(), received, px, wd.id]);
+      await addBooks(db, 'to_zec_zats', received);
+      await scheduleTranches(db, wd.id, Number(wd.zec_zats) - Number(wd.network_fee_zats) + received, received);
+    });
+    log.info({ withdrawal: wd.id, zats: received }, 'testnet: credits converted back (simulated); tranches scheduled');
+  }
+  return { action: 'none', why: 'testnet: simulated rails' };
 }
 
 /** Steps that move money before they record the result. Found open on a later tick = interrupted. */
