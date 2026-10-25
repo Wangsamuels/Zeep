@@ -20,7 +20,7 @@ export class ZeepApiError extends Error {
 
 export interface DepositStatus {
   intent_id: string;
-  status: "waiting" | "confirming" | "credited" | "expired";
+  status: "waiting" | "confirming" | "queued" | "credited" | "expired";
   address: string;
   expected_zats: number | null;
   /** First deposit of your day: Zeep credits your network fee back (usd.rebate_micro_usd). */
@@ -32,8 +32,15 @@ export interface DepositStatus {
     usd: { converted_zats: number; value_micro_usd: number; fee_micro_usd: number; rebate_micro_usd: number; amount_micro_usd: number; index: number };
   } | null;
   confirming: { amount_zats: number; confirmations: number; needed: number }[];
+  /**
+   * Confirmed and waiting to be credited. reason "daily_limit": the day's deposit limit is
+   * reached and it is credited automatically after `until` (next UTC midnight).
+   */
+  queued: { amount_zats: number; reason: "daily_limit" | "crediting"; until: string | null } | null;
   unclaimed_zats: number;
   expires_at: string;
+  /** Set by depositStatus() when a second payment to this address was moved to a new slot: poll that slot. */
+  claim?: { slot: number; intent_id: string };
 }
 
 /** What a withdrawal takes from each balance. */
@@ -48,8 +55,16 @@ export interface WithdrawalPlan {
    */
   needsConversion: boolean;
   conversionFeeMicro: bigint;
-  /** What should arrive (before network fees unless Zeep covers them; final amount depends on the conversion). */
+  /** What should arrive, after the payout network fees (final amount depends on the conversion). */
   estimatedZats: bigint;
+  /** Payout network fees taken from the ZEC (0 when Zeep is expected to cover them). */
+  networkFeeZats: bigint;
+  /**
+   * True when this looks like the first withdrawal of the UTC day and qualifies for covered
+   * network fees. It's an estimate: another device may already have withdrawn today, so the
+   * server's `network_fees_paid_by` in the withdrawal response is final.
+   */
+  networkFeesCovered: boolean;
 }
 
 interface TreeCache {
@@ -406,12 +421,17 @@ export class ZeepClient {
       pow: bits > 0 ? solvePow(intentId, bits) : undefined,
     }));
     this.book.nextDeposit = slot + 1;
+    if (st.status !== "credited" && !this.book.pendingDeposits.includes(slot)) this.book.pendingDeposits.push(slot);
     await this.changed();
     return { ...st, slot };
   }
 
-  /** Poll a deposit; adds its two notes to the book when it lands (and resets the refill stages). */
-  async depositStatus(slot: number): Promise<DepositStatus> {
+  /**
+   * Poll a deposit; adds its two notes to the book when it lands (and resets the refill stages).
+   * If a second payment reached the same address, it opens a claim on a new slot, returns it as
+   * `claim` and keeps polling it via pollDeposits() (it's in book.pendingDeposits).
+   */
+  async depositStatus(slot: number, opts: { claim?: boolean } = {}): Promise<DepositStatus> {
     const { intentId, rho, rhoZec } = depositSlot(this.keys, slot);
     const st = await this.api<DepositStatus>("/v1/deposits/status", this.json("POST", { intent_id: intentId }));
     const c = st.credited;
@@ -422,10 +442,23 @@ export class ZeepClient {
       if (c.usd.amount_micro_usd > 0) this.book.add(usd);
       if (c.zec.amount_zats > 0) this.book.add(zec);
       if (fresh) this.book.refill = { base: this.book.balance(USD).toString(), stage: 0 };
-      await this.changed();
     }
-    if (st.unclaimed_zats > 0) await this.startDeposit(undefined, intentId); // money sent twice to one address
+    const settled = st.status === "credited" || (st.status === "expired" && !st.confirming.length && !st.queued);
+    if (settled && this.book.pendingDeposits.includes(slot)) this.book.pendingDeposits = this.book.pendingDeposits.filter((s) => s !== slot);
+    if (c || settled) await this.changed();
+    if (st.unclaimed_zats > 0 && opts.claim !== false) {
+      // Money sent twice to one address: move it to a new slot and poll that one too.
+      const claim = await this.startDeposit(undefined, intentId);
+      return { ...st, claim: { slot: claim.slot, intent_id: claim.intent_id } };
+    }
     return st;
+  }
+
+  /** Poll every deposit still pending (including claims). Returns the statuses by slot. */
+  async pollDeposits(): Promise<Map<number, DepositStatus>> {
+    const out = new Map<number, DepositStatus>();
+    for (const slot of [...this.book.pendingDeposits]) out.set(slot, await this.depositStatus(slot));
+    return out;
   }
 
   // ---------------------------------------------------------------- withdrawals
@@ -437,6 +470,27 @@ export class ZeepClient {
    * `zats = "all"` withdraws everything (ZEC + all credits).
    */
   async planWithdrawal(zats: bigint | "all"): Promise<WithdrawalPlan> {
+    const gross = await this.planGross(zats);
+    // Payout network fees, as the server will apply them: paid by the user unless this is the
+    // first withdrawal of the UTC day, the tagged (larger) part is worth enough and Zeep's
+    // fee budget has room.
+    const [fees, px] = [await this.fees(), (await this.prices()).zec_usd as number];
+    const feeZats = BigInt(fees.withdrawal.network_fee_zats);
+    const zecMicro = BigInt(zatsToMicroUsd(gross.zecZats, px));
+    const tagged = gross.zecZats > 0n && (gross.usdMicro === 0n || zecMicro >= gross.usdMicro) ? zecMicro : gross.usdMicro;
+    const covered = fees.free_network_fees_available === true
+      && this.book.lastWithdrawalDay !== utcDay()
+      && tagged >= BigInt(fees.withdrawal.min_micro_usd_for_free);
+    const networkFeeZats = covered ? 0n : feeZats;
+    if (!gross.needsConversion && gross.zecZats <= networkFeeZats) {
+      throw new ZeepApiError("This amount is too small to cover the network fees.", 400, "too_small", { network_fee_zats: networkFeeZats.toString() });
+    }
+    const estimatedZats = gross.estimatedZats > networkFeeZats ? gross.estimatedZats - networkFeeZats : 0n;
+    return { ...gross, estimatedZats, networkFeeZats, networkFeesCovered: covered };
+  }
+
+  /** The plan before payout network fees. */
+  private async planGross(zats: bigint | "all"): Promise<Omit<WithdrawalPlan, "networkFeeZats" | "networkFeesCovered">> {
     const conf = this.conf ?? (await this.config());
     const feeBps = BigInt(conf.split.conversion_fee_bps.usd_to_zec);
     const minUsd = BigInt(conf.withdrawals.min_micro_usd);
@@ -501,6 +555,8 @@ export class ZeepClient {
           if (res.status === 409) await this.refreshSpent();
           throw new ZeepApiError(body?.error?.message ?? `HTTP ${res.status}`, res.status, body?.error?.code ?? "http", body);
         }
+        this.book.lastWithdrawalDay = utcDay(); // today's withdrawal tag is used now
+        await this.changed();
         return body;
       } finally {
         locked.forEach((n) => (n.pending = false));
@@ -553,16 +609,21 @@ export class ZeepClient {
     }
     onProgress?.("Finding deposits");
     let misses = 0;
+    const toClaim: number[] = [];
     for (let slot = 0; misses < 5; slot++) {
       try {
-        await this.depositStatus(slot);
+        // Don't claim mid-scan: a claim takes the next free slot, which may not be known yet.
+        const st = await this.depositStatus(slot, { claim: false });
         this.book.nextDeposit = Math.max(this.book.nextDeposit, slot + 1);
+        if (st.unclaimed_zats > 0) toClaim.push(slot);
+        else if (st.status !== "credited" && st.status !== "expired" && !this.book.pendingDeposits.includes(slot)) this.book.pendingDeposits.push(slot);
         misses = 0;
       } catch (e) {
         if (e instanceof ZeepApiError && e.status === 404) misses++;
         else throw e;
       }
     }
+    for (const slot of toClaim) await this.depositStatus(slot);
     onProgress?.("Checking spent notes");
     await this.refreshSpent();
     this.book.notes = this.book.notes.filter((n) => !n.spent);
@@ -593,4 +654,5 @@ export function solvePow(intentId: string, bits: number): string {
   }
 }
 
+const utcDay = (): number => Math.floor(Date.now() / 86_400_000);
 const toZats = (micro: bigint, zecUsd: number): bigint => (micro <= 0n ? 0n : BigInt(Math.floor((Number(micro) / 1e6 / zecUsd) * 1e8)));

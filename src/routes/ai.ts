@@ -7,7 +7,7 @@ import { cfg } from '../config.js';
 import { errors } from '../lib/errors.js';
 import { modalFetch } from '../services/modal.js';
 import { mppFetch } from '../services/mpp.js';
-import { chatUsd, modelById, priceSheet } from '../services/prices.js';
+import { chatMicroUsd, modelById, priceSheet } from '../services/prices.js';
 import { chargeRequest, pipeSse, upstreamJson, withCharge } from './paid.js';
 
 // Text, or OpenAI content parts: text and images (data: URLs, so nothing is fetched by URL).
@@ -46,7 +46,7 @@ export default async function aiRoutes(app: FastifyInstance) {
     const hasImage = body.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'));
     if (hasImage && !model.vision) throw errors.bad(`${model.name} can't read images; pick a model marked "reads images"`);
 
-    const s = await chargeRequest(req, reply, chatUsd(model, req.rawBody?.length ?? 0));
+    const s = await chargeRequest(req, reply, { micro: chatMicroUsd(model, req.rawBody?.length ?? 0) });
     return withCharge(s, reply, async () => {
       const upstreamModel = model.upstream ?? (model.id.startsWith('openai/') ? model.id.slice(7) : model.id);
       const out = { ...body, model: upstreamModel };

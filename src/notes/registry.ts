@@ -228,7 +228,7 @@ class Registry {
         const dailyCap = cfg.MAX_DEPOSIT_ZATS_PER_DAY ?? (cfg.ZEEP_ENV === 'testnet' ? cfg.TESTNET_MAX_DEPOSIT_ZATS_PER_DAY : undefined);
         if (dailyCap !== undefined) {
           const [{ z }] = (await c.query<{ z: string }>(
-            `SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE status = 'credited' AND created_at >= CURRENT_DATE`)).rows;
+            `SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE status = 'credited' AND credited_on = CURRENT_DATE`)).rows;
           cap = dailyCap - Number(z);
         }
         if (!due.rows.length) return;
@@ -243,7 +243,9 @@ class Registry {
             continue;
           }
           const zats = Number(r.amount_zats);
-          if (zats > cap) continue; // testnet daily cap: wait for tomorrow
+          // Daily cap: wait for the next UTC day. A single deposit larger than the whole cap is
+          // credited alone on a day with nothing else credited, so it can never be stuck forever.
+          if (zats > cap && !(dailyCap !== undefined && zats > dailyCap && cap === dailyCap)) continue;
           cap -= zats;
           done.add(r.intent_id);
           const kept = Math.floor((zats * cfg.ZEC_SHARE_BPS) / 10_000);
@@ -264,7 +266,7 @@ class Registry {
         const a = await this.appendInTx(c, leaves);
         publish = a.publish;
         for (const [i, r] of rows.entries()) {
-          await c.query(`UPDATE deposits SET status = 'credited' WHERE id = $1`, [r.id]);
+          await c.query(`UPDATE deposits SET status = 'credited', credited_on = CURRENT_DATE WHERE id = $1`, [r.id]);
           await c.query(
             `UPDATE deposit_intents SET status = 'credited', tree_id = $2, leaf_index = $3, zec_leaf_index = $4, amount_zats = $5,
                     zec_kept_zats = $6, converted_zats = $7, zec_usd = $8, value_micro_usd = $9, fee_micro_usd = $10,

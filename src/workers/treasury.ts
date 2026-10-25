@@ -40,7 +40,8 @@ export async function housekeeping(): Promise<void> {
         AND r.root NOT IN (SELECT root FROM roots r2 WHERE r2.tree_id = r.tree_id ORDER BY created_at DESC LIMIT ${cfg.NOTE_ROOT_HISTORY}) RETURNING 1`),
     q(`DELETE FROM deposit_sightings s USING deposits d WHERE d.txid_hash = s.txid_hash RETURNING 1`),
     q(`UPDATE deposit_intents SET status = 'expired' WHERE status = 'open' AND expires_at < now()
-        AND NOT EXISTS (SELECT 1 FROM deposit_sightings s WHERE s.intent_id = deposit_intents.id) RETURNING 1`),
+        AND NOT EXISTS (SELECT 1 FROM deposit_sightings s WHERE s.intent_id = deposit_intents.id)
+        AND NOT EXISTS (SELECT 1 FROM deposits d WHERE d.intent_id = deposit_intents.id AND d.status = 'confirmed') RETURNING 1`),
     q(`DELETE FROM daily_tags WHERE day < $1 RETURNING 1`, [Math.floor(Date.now() / 86_400_000) - 2]),
     q(`DELETE FROM inboxes WHERE expires_at < now() RETURNING 1`),
     q(`DELETE FROM vault_items WHERE expires_at IS NOT NULL AND expires_at < now() RETURNING 1`),

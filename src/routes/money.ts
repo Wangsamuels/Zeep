@@ -50,6 +50,11 @@ export function withdrawalAmounts(zecZats: number, usdMicro: number, networkFeeZ
   return { zecZats, usdMicro, conversionFee, convert: usdMicro - conversionFee, userNetworkZats, zecNow: zecZats - userNetworkZats };
 }
 
+/** The daily deposit limit in zats, if one is set (MAX_DEPOSIT_ZATS_PER_DAY; old testnet name too). */
+export function dailyDepositCap(): number | undefined {
+  return cfg.MAX_DEPOSIT_ZATS_PER_DAY ?? (cfg.ZEEP_ENV === 'testnet' ? cfg.TESTNET_MAX_DEPOSIT_ZATS_PER_DAY : undefined);
+}
+
 async function intentStatus(id: string) {
   const [i] = await q<{
     status: string; address: string; expected_zats: string | null; amount_zats: string | null; zec_usd: string | null;
@@ -62,9 +67,33 @@ async function intentStatus(id: string) {
     `SELECT s.amount_zats, s.confirmations FROM deposit_sightings s
       WHERE s.intent_id = $1 AND NOT EXISTS (SELECT 1 FROM deposits d WHERE d.txid_hash = s.txid_hash)`, [id]);
   const [u] = await q<{ z: string }>(`SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE intent_id = $1 AND status = 'unclaimed'`, [id]);
+  // Confirmed but not credited yet: normally seconds; longer only when the daily cap is full.
+  const [held] = await q<{ z: string }>(`SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE intent_id = $1 AND status = 'confirmed'`, [id]);
+  const heldZats = i.status === 'credited' ? 0 : Number(held.z);
+  let queued: { amount_zats: number; reason: 'daily_limit' | 'crediting'; until: string | null } | null = null;
+  if (heldZats > 0) {
+    const cap = dailyDepositCap();
+    let full = false;
+    if (cap !== undefined) {
+      const [{ z }] = await q<{ z: string }>(`SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE status = 'credited' AND credited_on = CURRENT_DATE`);
+      const used = Number(z);
+      full = heldZats > cap - used && !(heldZats > cap && used === 0);
+    }
+    const tomorrow = new Date();
+    tomorrow.setUTCHours(24, 0, 0, 0);
+    queued = full
+      ? { amount_zats: heldZats, reason: 'daily_limit', until: tomorrow.toISOString() }
+      : { amount_zats: heldZats, reason: 'crediting', until: null };
+  }
   return {
     intent_id: id,
-    status: i.status === 'credited' ? 'credited' : pending.length ? 'confirming' : i.expires_at < new Date() ? 'expired' : 'waiting',
+    status: i.status === 'credited' ? 'credited'
+      : queued ? 'queued'
+      : pending.length ? 'confirming'
+      : i.expires_at < new Date() ? 'expired' : 'waiting',
+    // Confirmed on chain and waiting to be credited. reason 'daily_limit': the day's deposit
+    // limit is reached; it is credited automatically after `until` (next UTC midnight).
+    queued,
     address: i.address,
     expected_zats: i.expected_zats == null ? null : Number(i.expected_zats),
     first_today: i.rebate_eligible,

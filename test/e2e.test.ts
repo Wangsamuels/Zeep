@@ -13,6 +13,7 @@ import type { AddressInfo } from 'node:net';
 import type { FastifyInstance } from 'fastify';
 import { generateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
+import { cfg } from '../src/config.js';
 import { pool, q } from '../src/lib/db.js';
 import { redis } from '../src/lib/redis.js';
 import { migrate } from '../src/migrate.js';
@@ -209,6 +210,8 @@ test('withdraw: from ZEC instantly; beyond the ZEC balance credits convert back 
   const zec0 = alice.balance(ZEC);
   const p1 = await alice.planWithdrawal(4_000_000n);
   assert.equal(p1.needsConversion, false);
+  assert.equal(p1.networkFeesCovered, true); // first of the day: the plan shows the full amount arriving
+  assert.equal(p1.estimatedZats, 4_000_000n);
   const w1 = await alice.withdraw(p1, SAPLING);
   assert.equal(w1.status, 'scheduled');
   assert.equal(w1.processing.converting, false);
@@ -220,10 +223,14 @@ test('withdraw: from ZEC instantly; beyond the ZEC balance credits convert back 
   // 2) Transparent needs the opt-in; the second withdrawal today pays its own network fees.
   const taddr = TADDR;
   const p2 = await alice.planWithdrawal(2_500_000n);
+  assert.equal(p2.networkFeesCovered, false); // second today: the plan already takes the fees off
+  assert.equal(p2.networkFeeZats, 20_000n);
+  assert.equal(p2.estimatedZats, 2_480_000n);
   await assert.rejects(alice.withdraw(p2, taddr), /allow_transparent/);
   const w2 = await alice.withdraw(p2, taddr, { allowTransparent: true });
   assert.equal(w2.network_fees_paid_by, 'you');
   assert.equal(w2.estimated_zec_zats, 2_500_000 - 20_000);
+  assert.equal(BigInt(w2.estimated_zec_zats), p2.estimatedZats); // plan and server agree
   assert.equal(w2.transparent, true);
   assert.match(w2.warning, /public/);
 
@@ -275,17 +282,51 @@ test('safety: two payments to one deposit address become one credit plus a claim
   const d = await alice.startDeposit(4_000_000n);
   await payInto(d.address, 4_000_000);
   await payInto(d.address, 2_000_000); // same block: the activator sees both in one batch
-  await until(async () => (await alice.depositStatus(d.slot)).credited);
-  const st = await alice.depositStatus(d.slot); // sees the second payment as unclaimed → claims it
-  const claimSlot = alice.book.nextDeposit - 1;
+  // Whichever poll first sees the second payment as unclaimed claims it and returns the new slot.
+  let claim: { slot: number } | undefined;
+  await until(async () => {
+    const s = await alice.depositStatus(d.slot);
+    claim ??= s.claim;
+    return !!s.credited && !!claim;
+  });
+  const st = await alice.depositStatus(d.slot);
+  assert.equal(st.claim, undefined); // claimed once, not again
+  const claimSlot = claim!.slot;
   assert.notEqual(claimSlot, d.slot);
-  await until(async () => (await alice.depositStatus(claimSlot)).credited);
+  assert.ok(alice.book.pendingDeposits.includes(claimSlot), 'the claim is tracked for polling');
+  assert.ok(!alice.book.pendingDeposits.includes(d.slot), 'the credited slot is done');
+  await until(async () => { await alice.pollDeposits(); return !alice.book.pendingDeposits.includes(claimSlot); });
   const c1 = st.credited!;
   const c2 = (await alice.depositStatus(claimSlot)).credited!;
   assert.equal(c1.zec_zats + c2.zec_zats, 6_000_000); // both payments credited, once each
   assert.equal(alice.balance(ZEC), before.zec + BigInt(c1.zec.amount_zats + c2.zec.amount_zats));
   const [dup] = await q<{ n: number }>('SELECT count(*)::int AS n FROM (SELECT commitment FROM notes GROUP BY commitment HAVING count(*) > 1) x');
   assert.equal(dup.n, 0);
+  await sleep(1500);
+  await settleFloat();
+});
+
+test('daily deposit limit: a payment over it shows as queued until the next UTC day, never stuck', { timeout: 120_000 }, async () => {
+  const [{ z }] = await q<{ z: string }>(`SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE status = 'credited' AND credited_on = CURRENT_DATE`);
+  const c = cfg as { MAX_DEPOSIT_ZATS_PER_DAY?: number };
+  const saved = c.MAX_DEPOSIT_ZATS_PER_DAY;
+  c.MAX_DEPOSIT_ZATS_PER_DAY = Number(z) + 1_000_000; // only 0.01 ZEC left today
+  try {
+    const d = await alice.startDeposit(3_000_000n);
+    await payInto(d.address, 3_000_000);
+    await until(async () => (await alice.depositStatus(d.slot)).status === 'queued');
+    const st = await alice.depositStatus(d.slot);
+    assert.equal(st.queued?.reason, 'daily_limit');
+    assert.equal(st.queued?.amount_zats, 3_000_000);
+    assert.equal(new Date(st.queued!.until!).getUTCHours(), 0);
+    await housekeeping(); // must not expire an intent whose payment is waiting
+    assert.notEqual((await alice.depositStatus(d.slot)).status, 'expired');
+    c.MAX_DEPOSIT_ZATS_PER_DAY = saved; // "the next day"
+    await until(async () => (await alice.depositStatus(d.slot)).credited);
+    assert.ok(!alice.book.pendingDeposits.includes(d.slot));
+  } finally {
+    c.MAX_DEPOSIT_ZATS_PER_DAY = saved;
+  }
   await sleep(1500);
   await settleFloat();
 });

@@ -14,11 +14,12 @@ declare module 'fastify' {
 }
 
 /**
- * Verify the request's `X-Zeep-Proof` spend and charge `usd` (+ markup) in micro-USD.
+ * Verify the request's `X-Zeep-Proof` spend and charge `usd` (+ markup) in micro-USD, or an
+ * exact `{ micro }` amount that already includes the markup.
  * Sets `X-Zeep-Notes: <tree>:<i0>,<i1>` so the client knows where its change landed.
  */
-export async function chargeRequest(req: FastifyRequest, reply: FastifyReply, usd: number): Promise<Spent> {
-  const minCost = requiredMicroUsd(usd);
+export async function chargeRequest(req: FastifyRequest, reply: FastifyReply, price: number | { micro: number }): Promise<Spent> {
+  const minCost = typeof price === 'number' ? requiredMicroUsd(price) : price.micro;
   const bundle = bundleFromHeaders(req.headers);
   const s = await spend({
     bundle,

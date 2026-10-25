@@ -152,6 +152,15 @@ export function chatUsd(model: ModelInfo, bodyBytes: number): number {
   return model.usd + extraMb * cfg.ATTACHMENT_USD_PER_MB;
 }
 
+/**
+ * What a chat request is charged, in micro-USD: exactly the sum of the published figures
+ * (model.micro_usd + extra MB × attachments.micro_usd_per_mb), each marked up and rounded on its own.
+ */
+export function chatMicroUsd(model: ModelInfo, bodyBytes: number): number {
+  const extraMb = Math.max(0, Math.ceil((bodyBytes - 64 * 1024) / (1024 * 1024)));
+  return requiredMicroUsd(model.usd) + extraMb * requiredMicroUsd(cfg.ATTACHMENT_USD_PER_MB);
+}
+
 /** Public price sheet for the frontend. Every amount is what a request is actually charged. */
 export async function priceSheet() {
   const q = await zecQuotes();

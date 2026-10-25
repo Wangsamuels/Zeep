@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { isTransparent, validPayoutAddress, withdrawalAmounts } from '../src/routes/money.js';
 import { marginOf } from '../src/services/fees.js';
 import { decide } from '../src/treasury/float.js';
-import { chatUsd, requiredMicroUsd, withMarkup, zatsToMicroUsd } from '../src/services/prices.js';
+import { chatMicroUsd, chatUsd, requiredMicroUsd, withMarkup, zatsToMicroUsd } from '../src/services/prices.js';
 import { convertSignal, solvePow, decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
 import { buildSpend } from '../sdk/spend';
 import { CIRCUIT, nodeProve } from './helpers/prove.js';
@@ -88,6 +88,12 @@ test('prices: USD + 4.5% markup, charged in micro-USD; attachments metered per s
   const m = { id: 'x', name: 'x', host: 'zeep' as const, usd: 0.002, vision: false, detail: '', testnet: true };
   assert.equal(chatUsd(m, 10_000), 0.002);
   assert.equal(chatUsd(m, 64 * 1024 + 1), 0.002 + 0.01);
+  // Charged = exactly the published figures added up (each marked up and rounded on its own).
+  const odd = { ...m, usd: 0.0021 };
+  for (const mb of [0, 1, 3, 7]) {
+    const bytes = mb === 0 ? 1000 : 64 * 1024 + mb * 1024 * 1024;
+    assert.equal(chatMicroUsd(odd, bytes), requiredMicroUsd(0.0021) + mb * requiredMicroUsd(0.01));
+  }
 });
 
 test('withdrawal maths and address checks (transparent only when opted in)', () => {
