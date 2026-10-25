@@ -12,3 +12,6 @@ circuits/zeep_spend_js/
 # local Redis snapshots
 *.rdb
 .DS_Store
+
+# Cloudflare wrangler local cache
+.wrangler/

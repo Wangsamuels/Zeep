@@ -17,7 +17,10 @@ export default {
   async fetch(request, env) {
     if (!env.ORIGIN || !env.RELAY_SHARED_SECRET) return new Response('relay not configured', { status: 500 });
     const url = new URL(request.url);
-    const target = new URL(url.pathname + url.search, env.ORIGIN);
+    if (env.ORIGIN.includes('REPLACE-')) return new Response('relay ORIGIN is still the placeholder in wrangler.toml', { status: 500 });
+    // Collapse leading slashes so "//v1/x" (a trailing slash in the frontend's API URL) can't
+    // be read as a different host.
+    const target = new URL(url.pathname.replace(/^\/+/, '/') + url.search, env.ORIGIN);
 
     const headers = new Headers();
     for (const [name, value] of request.headers) if (passes(name.toLowerCase())) headers.set(name, value);

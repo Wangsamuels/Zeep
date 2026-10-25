@@ -89,6 +89,7 @@ echo "      MODAL_LLM_BASE_URL, MODAL_PROXY_TOKEN   your Modal deployment (self-
 if [[ "$NET" == "mainnet" ]]; then
   echo "      TEMPO_PRIVATE_KEY        EVM key of the treasury wallet (gas on Base + Tempo, USDC.e float)"
   echo "      TEMPO_RPC_URL, BASE_RPC_URL   RPC endpoints for Tempo and Base"
+  echo "      RELAY_API_KEY            Relay.link API key (Relay dashboard → Apps); bridge quotes need it"
 fi
 echo
 echo " 3. Deploy: Heroku dashboard → $APP → Deploy → GitHub → connect Wangsamuels/Zeep → Deploy branch main"

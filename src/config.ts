@@ -177,6 +177,8 @@ const Env = z.object({
   // Base USDC ⇄ Tempo USDC.e (chain 4217). The same EVM key (TEMPO_PRIVATE_KEY) is used on both.
   BASE_RPC_URL: z.string().default('https://mainnet.base.org'),
   RELAY_API_URL: z.string().default('https://api.relay.link'),
+  // Relay.link API key (Relay dashboard → Apps). Required for quotes since 2 Oct 2026; mainnet only (testnet rails are simulated).
+  RELAY_API_KEY: z.string().optional(),
   BASE_USDC: z.string().default('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'),
   TEMPO_USDC_E: z.string().default('0x20C000000000000000000000b9537d11c60E8b50'),
   TEMPO_CHAIN_ID: int(4217),
@@ -235,6 +237,7 @@ export function networkProblems(c: Config): string[] {
   }
   if (main) {
     if (c.TREASURY_RAILS !== 'live') p.push('mainnet needs TREASURY_RAILS=live');
+    if (c.TREASURY_RAILS === 'live' && !c.RELAY_API_KEY) p.push('mainnet needs RELAY_API_KEY (Relay.link requires a key for bridge quotes)');
     if (c.MPP_MODE !== 'live') p.push('mainnet needs MPP_MODE=live');
     if (!c.SPEND_VKEY_SHA256) p.push('mainnet needs SPEND_VKEY_SHA256 (pin the verifying key from the ceremony)');
     if (c.ALLOW_PRICE_FALLBACK) p.push('ALLOW_PRICE_FALLBACK is not allowed on mainnet');
@@ -255,7 +258,7 @@ function load(): Config {
   // possible on Heroku (DYNO is set there) or outside NODE_ENV=test.
   if (process.env.ZEEP_TEST_SIMULATION === '1') {
     if (process.env.DYNO || parsed.data.NODE_ENV !== 'test') throw new Error('ZEEP_TEST_SIMULATION is for local tests only');
-    problems = problems.filter((m) => /ZCASH_NETWORK|ZEEP_RECEIVE_UA|ZEEP_RESERVE_TADDR|TREASURY_REFUND_TO/.test(m));
+    problems = problems.filter((m) => /ZCASH_NETWORK|ZEEP_RECEIVE_UA|ZEEP_RESERVE_TADDR|TREASURY_REFUND_TO/.test(m) && !/RELAY_API_KEY/.test(m));
   }
   if (problems.length) throw new Error(`Invalid configuration for ${parsed.data.ZEEP_ENV}: ${problems.join('; ')}`);
   return parsed.data;

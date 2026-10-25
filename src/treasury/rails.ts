@@ -35,6 +35,9 @@ export interface Rails {
 }
 
 // ------------------------------------------------------------------------------ live
+/** Relay.link needs `x-api-key` on quotes (since 2 Oct 2026); also sent on status calls for higher limits. */
+const relayHeaders = (h: Record<string, string>): Record<string, string> =>
+  cfg.RELAY_API_KEY ? { ...h, 'x-api-key': cfg.RELAY_API_KEY } : h;
 function oneClick() {
   OpenAPI.BASE = cfg.NEAR_ONECLICK_BASE_URL;
   OpenAPI.TOKEN = need('NEAR_ONECLICK_JWT');
@@ -126,7 +129,7 @@ const live: Rails = {
     const getQuote = async (): Promise<Quote> => {
       const res = await fetch(`${cfg.RELAY_API_URL}/quote/v2`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: relayHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify({
           user: who.address,
           recipient: who.address,
@@ -166,7 +169,10 @@ const live: Rails = {
   },
 
   async bridgeStatus(requestId) {
-    const r = await fetch(`${cfg.RELAY_API_URL}/intents/status/v3?requestId=${encodeURIComponent(requestId)}`, { signal: AbortSignal.timeout(15_000) });
+    const r = await fetch(`${cfg.RELAY_API_URL}/intents/status/v3?requestId=${encodeURIComponent(requestId)}`, {
+      headers: relayHeaders({}),
+      signal: AbortSignal.timeout(15_000),
+    });
     if (!r.ok) return 'pending';
     const s = ((await r.json()) as { status?: string }).status ?? 'pending';
     return s === 'success' ? 'success' : ['failure', 'refund', 'refunded'].includes(s) ? 'failed' : 'pending';

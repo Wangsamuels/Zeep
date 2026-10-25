@@ -10,7 +10,7 @@ enabled = false
 
 [env.testnet]
 name = "zeep-relay-testnet"
-vars = { ORIGIN = "https://REPLACE-zeep-test.herokuapp.com" }
+vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com" }
 
 [env.mainnet]
 name = "zeep-relay-mainnet"

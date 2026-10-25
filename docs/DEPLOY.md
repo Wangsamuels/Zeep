@@ -82,6 +82,7 @@ Also check that the Heroku URL called directly answers **403 `relay_required`**.
 | `NEAR_ONECLICK_JWT` | your 1Click key: live ZEC price (required on mainnet) |
 | `MODAL_LLM_BASE_URL`, `MODAL_PROXY_TOKEN` | your Modal deployment (self-hosted models) |
 | **Mainnet only:** `TEMPO_PRIVATE_KEY`, `TEMPO_RPC_URL`, `BASE_RPC_URL` | the treasury's EVM key and RPC endpoints |
+| **Mainnet only:** `RELAY_API_KEY` | Relay.link key (Relay dashboard → Apps): bridge quotes need it since 2 Oct 2026. Not the same as `RELAY_SHARED_SECRET` (your Cloudflare relay). |
 | *Optional:* `MPP_MODE=live` + `TESTNET_LIVE_MPP=true` | real AI answers on testnet, paid by you |
 
 ## 4. Deploy the code

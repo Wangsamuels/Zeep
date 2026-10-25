@@ -54,7 +54,10 @@ test('testnet and mainnet can never be mixed up by configuration', () => {
   const main = { ...base, ZEEP_ENV: 'mainnet' as const, ZCASH_NETWORK: 'main' as const, PUBLIC_API_BASE_URL: 'https://api.zeep.app' };
   const p = networkProblems({ ...main, TREASURY_RAILS: 'mock', MPP_MODE: 'mock', SPEND_VKEY_SHA256: '', ALLOW_PRICE_FALLBACK: true, REQUIRE_RELAY: false, ALLOW_NO_RELAY: false }).join();
   for (const m of [/TREASURY_RAILS=live/, /MPP_MODE=live/, /SPEND_VKEY_SHA256/, /ALLOW_PRICE_FALLBACK/, /REQUIRE_RELAY/]) assert.match(p, m);
-  assert.deepEqual(networkProblems({ ...main, TREASURY_RAILS: 'live', MPP_MODE: 'live', SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
+  assert.match(networkProblems({ ...main, TREASURY_RAILS: 'live', RELAY_API_KEY: undefined }).join(), /RELAY_API_KEY/);
+  // Testnet can never move real money.
+  assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test', TREASURY_RAILS: 'live' }).join(), /TREASURY_RAILS=mock/);
+  assert.deepEqual(networkProblems({ ...main, TREASURY_RAILS: 'live', RELAY_API_KEY: 'k', MPP_MODE: 'live', SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
     ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100), ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33) }), []);
 });
 
