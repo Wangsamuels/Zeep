@@ -10,7 +10,7 @@ import { errors } from '../lib/errors.js';
 import { keys, redis } from '../lib/redis.js';
 import { summarize } from '../services/modal.js';
 import { mppFetch } from '../services/mpp.js';
-import { routeUsd } from '../services/prices.js';
+import { researchUsd, routeUsd } from '../services/prices.js';
 import { chargeRequest, upstreamJson, withCharge } from './paid.js';
 
 const json = (body: unknown): RequestInit => ({
@@ -65,12 +65,12 @@ export default async function serviceRoutes(app: FastifyInstance) {
     });
   });
 
-  // ---- research (10 credits, async job) ----
+  // ---- research (async job; priced per processor: research_base / research_core / research_pro) ----
   const Research = z.object({ query: z.string().min(1).max(4000), processor: z.enum(['base', 'core', 'pro']).default('base') });
   app.post('/v1/research', async (req, reply) => {
     const b = Research.safeParse(req.body);
     if (!b.success) throw errors.bad('invalid research request');
-    const c = await chargeRequest(req, reply, routeUsd('research'));
+    const c = await chargeRequest(req, reply, researchUsd(b.data.processor));
     return withCharge(c, reply, async () => {
       const [url, init] = PROVIDERS.parallelCreate(b.data.query, b.data.processor);
       const j = (await upstreamJson(await mppFetch('research', url, init))) as any;

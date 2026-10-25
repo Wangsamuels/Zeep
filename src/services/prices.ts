@@ -136,6 +136,12 @@ export function routeUsd(key: string): number {
   return usd;
 }
 
+/** Research price for a Parallel processor. A flat legacy `research` price still works if set. */
+export function researchUsd(processor: 'base' | 'core' | 'pro'): number {
+  const prices = cfg.SERVICE_PRICES_USD_JSON;
+  return routeUsd(prices[`research_${processor}`] !== undefined ? `research_${processor}` : 'research');
+}
+
 export function modelById(id: string): ModelInfo | undefined {
   return models().find((m) => m.id === id);
 }

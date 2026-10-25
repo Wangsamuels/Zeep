@@ -69,7 +69,7 @@ const Env = z.object({
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
-    '{"search":0.01,"research":0.25,"health":0.005,"rpc100":0.002,"inbox":0.30}',
+    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"rpc100":0.002,"inbox":0.30}',
   ),
   // Models shown in the picker, each with a per-response USD price.
   MODELS_JSON: json(
