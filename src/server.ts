@@ -14,6 +14,7 @@ import aiRoutes from './routes/ai.js';
 import internalRoutes from './routes/internal.js';
 import moneyRoutes from './routes/money.js';
 import publicRoutes from './routes/public.js';
+import inboxRoutes from './routes/inbox.js';
 import serviceRoutes from './routes/services.js';
 import vaultRoutes from './routes/vault.js';
 
@@ -86,6 +87,7 @@ export async function buildApp() {
   await app.register(publicRoutes);
   await app.register(aiRoutes);
   await app.register(serviceRoutes);
+  await app.register(inboxRoutes);
   await app.register(moneyRoutes);
   await app.register(vaultRoutes);
   await app.register(internalRoutes);

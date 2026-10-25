@@ -393,6 +393,64 @@ test('reserve: ZEC held covers ZEC owed, dollars held cover dollars owed, and th
   assert.equal(pub.zec.owed_zats % 1_000_000, 0); // and 0.01 ZEC
 });
 
+test('anonymous inbox: create, list, read the full letter, send, reply, delete; id never in a URL', { timeout: 120_000 }, async () => {
+  const prices = await alice.prices();
+  const sendCost = BigInt(prices.routes.inbox_send.micro_usd);
+  const usd0 = alice.balance(USD);
+  const box = await alice.createInbox();
+  assert.match(box.inbox_id, /^ibx_/);
+  assert.equal(alice.balance(USD), usd0 - BigInt(prices.routes.inbox.micro_usd));
+
+  const page = await alice.inboxMessages(box.inbox_id);
+  assert.equal(page.messages.length, 1);
+  const item = page.messages[0];
+  assert.ok(item.preview.length > 0 && item.preview.length <= 200);
+  assert.equal(item.read, false);
+  const full = await alice.readMessage(box.inbox_id, item.id);
+  assert.match(full.text!, /Real mail arrives/); // the full letter, not the preview
+  assert.match(full.html!, /<p>/);
+
+  const usd1 = alice.balance(USD);
+  const sent = await alice.sendEmail(box.inbox_id, { to: ['bob@example.com'], subject: 'hi', text: 'hello' });
+  assert.ok(sent.message_id);
+  const rep = await alice.replyEmail(box.inbox_id, item.id, { text: 'thanks' });
+  assert.ok(rep.message_id);
+  assert.equal(alice.balance(USD), usd1 - 2n * sendCost);
+
+  // Bad input is refused before any payment.
+  await assert.rejects(alice.sendEmail(box.inbox_id, { to: ['not-an-address'], subject: 'x', text: 'y' }), /not an email address/);
+  await assert.rejects(alice.sendEmail(box.inbox_id, { to: ['a@example.com'], subject: 'x' }), /write a message/);
+  await assert.rejects(alice.sendEmail(box.inbox_id, { to: Array.from({ length: 11 }, (_, i) => `u${i}@example.com`), subject: 'x', text: 'y' }), /at most 10/);
+  assert.equal(alice.balance(USD), usd1 - 2n * sendCost);
+
+  // Delete hides it at once.
+  const del = await alice.deleteMessage(box.inbox_id, item.id);
+  assert.equal(del.deleted, true);
+  assert.equal((await alice.inboxMessages(box.inbox_id)).messages.length, 0);
+  await assert.rejects(alice.readMessage(box.inbox_id, item.id), /not found/);
+
+  // Unknown inbox: 404; the old GET route with the id in the path is gone.
+  await assert.rejects(alice.inboxMessages('ibx_' + 'A'.repeat(32)), /not found/);
+  assert.equal((await fetch(`${base}/v1/inbox/${box.inbox_id}/messages`)).status, 404);
+
+  // Daily send limit: refused without charging.
+  const c = cfg as { INBOX_SENDS_PER_DAY: number };
+  const saved = c.INBOX_SENDS_PER_DAY;
+  c.INBOX_SENDS_PER_DAY = 2;
+  try {
+    const usd2 = alice.balance(USD);
+    await assert.rejects(alice.sendEmail(box.inbox_id, { to: ['bob@example.com'], subject: 'x', text: 'y' }), /2 emails a day/);
+    assert.equal(alice.balance(USD), usd2);
+  } finally {
+    c.INBOX_SENDS_PER_DAY = saved;
+  }
+
+  // Expired inboxes are deleted at the provider and forgotten.
+  await q(`UPDATE inboxes SET expires_at = now() - interval '1 minute' WHERE id = $1`, [box.inbox_id]);
+  await housekeeping();
+  assert.equal((await q('SELECT 1 FROM inboxes WHERE id = $1', [box.inbox_id])).length, 0);
+});
+
 test('encrypted vault: chat items with 30-day auto-delete, auth required', async () => {
   const url = `${base}/v1/vault/items/chat-1`;
   const h = { 'content-type': 'application/json', 'x-vault-id': keys.vaultId, 'x-vault-auth': keys.vaultAuth };

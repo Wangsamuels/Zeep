@@ -69,7 +69,7 @@ const Env = z.object({
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
-    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"rpc100":0.002,"inbox":0.30}',
+    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"rpc100":0.002,"inbox":0.30,"inbox_send":0.01}',
   ),
   // Models shown in the picker, each with a per-response USD price.
   MODELS_JSON: json(
@@ -207,7 +207,11 @@ const Env = z.object({
     z.record(z.string(), z.string()),
     '{"ethereum":"{alchemy}/eth-mainnet","base":"{alchemy}/base-mainnet","arbitrum":"{alchemy}/arb-mainnet","solana":"{quicknode}/solana-mainnet"}',
   ),
-  INBOX_PROVIDER: z.enum(['stableemail', 'agentmail']).default('stableemail'),
+  INBOX_PROVIDER: z.enum(['agentmail', 'stableemail']).default('agentmail'),
+  // Anti-abuse limits per inbox (sending costs money and reputation; reads cost Zeep MPP fees).
+  INBOX_SENDS_PER_DAY: int(20),
+  INBOX_MAX_RECIPIENTS: int(10),
+  INBOX_READS_PER_HOUR: int(240),
 
   // Self-hosted models (Modal)
   MODAL_LLM_BASE_URL: z.string().default(''),
@@ -229,6 +233,10 @@ export function networkProblems(c: Config): string[] {
   const taddr = main ? /^t1[1-9A-HJ-NP-Za-km-z]{33}$/ : /^tm[1-9A-HJ-NP-Za-km-z]{33}$/;
   if (c.ZEEP_RESERVE_TADDR && !taddr.test(c.ZEEP_RESERVE_TADDR)) p.push(`ZEEP_RESERVE_TADDR is not a ${c.ZCASH_NETWORK}net transparent (P2PKH) address`);
   if (c.TREASURY_REFUND_TO && !taddr.test(c.TREASURY_REFUND_TO)) p.push(`TREASURY_REFUND_TO is not a ${c.ZCASH_NETWORK}net transparent address`);
+  // StableEmail charges Zeep $1 per 30-day inbox: never sell one for less.
+  if (c.INBOX_PROVIDER === 'stableemail' && (c.SERVICE_PRICES_USD_JSON.inbox ?? 0) < 1) {
+    p.push('INBOX_PROVIDER=stableemail costs $1 per inbox: set "inbox" to at least 1.00 in SERVICE_PRICES_USD_JSON');
+  }
   if (!main) {
     // Testnet ZEC is free: it must never move real money. The rails are always simulated, and
     // real paid services only with an explicit opt-in (keep MPP_DAILY_BUDGET_USD small).

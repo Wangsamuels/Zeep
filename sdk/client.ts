@@ -43,6 +43,26 @@ export interface DepositStatus {
   claim?: { slot: number; intent_id: string };
 }
 
+/** A message in the inbox list (short preview only). */
+export interface InboxMessageItem {
+  id: string;
+  thread_id: string | null;
+  from: string;
+  to: string[];
+  subject: string;
+  preview: string;
+  received_at: string;
+  read: boolean;
+}
+/** A full message. `html` comes from the sender: render it sandboxed (no scripts, no remote loads). */
+export interface InboxMessage extends InboxMessageItem {
+  cc: string[];
+  reply_to: string[];
+  text: string | null;
+  html: string | null;
+  attachments: { filename: string; content_type: string; size: number }[];
+}
+
 /** What a withdrawal takes from each balance. */
 export interface WithdrawalPlan {
   /** Zats from ZEC notes, paid as they are. */
@@ -163,6 +183,44 @@ export class ZeepClient {
   }
   fees() {
     return this.api<any>("/v1/fees");
+  }
+
+  // ---------------------------------------------------------------- anonymous inbox
+  // The inbox id is a bearer secret: these methods only ever send it in POST bodies.
+  // Keep it in the encrypted vault, not in URLs, analytics or logs.
+
+  /** Paid: create a 30-day inbox (routes.inbox). */
+  async createInbox(): Promise<{ inbox_id: string; address: string; expires_at: string }> {
+    const cost = BigInt((await this.prices()).routes.inbox.micro_usd);
+    return this.paidJson("/v1/inbox", {}, cost);
+  }
+  /** List messages, newest first. Each has a short `preview`; use readMessage() for the full letter. */
+  inboxMessages(inboxId: string, opts: { cursor?: string; limit?: number } = {}): Promise<{ address: string; expires_at: string; messages: InboxMessageItem[]; next_cursor: string | null }> {
+    return this.api("/v1/inbox/messages", this.json("POST", { inbox_id: inboxId, cursor: opts.cursor, limit: opts.limit }));
+  }
+  /** One full message: text, html (untrusted: render sandboxed) and attachment names. Marks it read. */
+  async readMessage(inboxId: string, messageId: string): Promise<InboxMessage> {
+    return (await this.api<{ message: InboxMessage }>("/v1/inbox/messages/read", this.json("POST", { inbox_id: inboxId, message_id: messageId }))).message;
+  }
+  /** Paid (routes.inbox_send): send a new email from the inbox. */
+  async sendEmail(inboxId: string, mail: { to: string | string[]; cc?: string | string[]; subject: string; text?: string; html?: string }): Promise<{ message_id: string; thread_id: string | null }> {
+    const cost = BigInt((await this.prices()).routes.inbox_send.micro_usd);
+    return this.paidJson("/v1/inbox/send", { inbox_id: inboxId, ...mail }, cost);
+  }
+  /** Paid (routes.inbox_send): reply to a message (replyAll adds the other recipients). */
+  async replyEmail(inboxId: string, messageId: string, mail: { text?: string; html?: string; replyAll?: boolean }): Promise<{ message_id: string; thread_id: string | null }> {
+    const cost = BigInt((await this.prices()).routes.inbox_send.micro_usd);
+    return this.paidJson("/v1/inbox/reply", { inbox_id: inboxId, message_id: messageId, text: mail.text, html: mail.html, reply_all: mail.replyAll ?? false }, cost);
+  }
+  /** Delete a message (free). It disappears from the list at once. */
+  deleteMessage(inboxId: string, messageId: string): Promise<{ deleted: true; removed_at_provider: boolean }> {
+    return this.api("/v1/inbox/messages/delete", this.json("POST", { inbox_id: inboxId, message_id: messageId }));
+  }
+  private async paidJson<T>(path: string, body: unknown, cost: bigint): Promise<T> {
+    const res = await this.pay("POST", path, JSON.stringify(body), cost);
+    const j = await res.json().catch(() => null);
+    if (!res.ok) throw new ZeepApiError(j?.error?.message ?? `HTTP ${res.status}`, res.status, j?.error?.code ?? "http", j);
+    return j as T;
   }
 
   // ---------------------------------------------------------------- trees

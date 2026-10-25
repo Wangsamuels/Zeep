@@ -27,18 +27,6 @@ export const PROVIDERS = {
   parallelResult: (runId: string) => `${cfg.MPP_PARALLEL_URL}/v1/tasks/runs/${encodeURIComponent(runId)}/result`,
   rxatlas: (query: string) => `${cfg.MPP_RXATLAS_URL}/v1/drugs/search?q=${encodeURIComponent(query)}`,
   trialbase: (query: string) => `${cfg.MPP_TRIALBASE_URL}/v1/trials/search?q=${encodeURIComponent(query)}`,
-  inbox: {
-    stableemail: {
-      create: () => [`${cfg.MPP_STABLEEMAIL_URL}/v1/inboxes`, json({ ttl_days: 30 })] as const,
-      messages: (ref: string) => `${cfg.MPP_STABLEEMAIL_URL}/v1/inboxes/${encodeURIComponent(ref)}/messages`,
-      parse: (j: any) => ({ ref: String(j.id ?? j.inbox_id), address: String(j.address ?? j.email) }),
-    },
-    agentmail: {
-      create: () => [`${cfg.MPP_AGENTMAIL_URL}/v0/inboxes`, json({})] as const,
-      messages: (ref: string) => `${cfg.MPP_AGENTMAIL_URL}/v0/inboxes/${encodeURIComponent(ref)}/messages`,
-      parse: (j: any) => ({ ref: String(j.inbox_id), address: String(j.inbox_id) }),
-    },
-  },
 };
 
 
@@ -131,28 +119,5 @@ export default async function serviceRoutes(app: FastifyInstance) {
     });
   });
 
-  // ---- anonymous inbox (30 credits, 30 days) ----
-  app.post('/v1/inbox', async (req, reply) => {
-    const c = await chargeRequest(req, reply, routeUsd('inbox'));
-    return withCharge(c, reply, async () => {
-      const p = PROVIDERS.inbox[cfg.INBOX_PROVIDER];
-      const [url, init] = p.create();
-      const { ref, address } = p.parse(await upstreamJson(await mppFetch('inbox', url, init)));
-      const id = 'ibx_' + randomBytes(24).toString('base64url');
-      const expires = new Date(Date.now() + 30 * 86_400_000);
-      await q('INSERT INTO inboxes (id, provider, provider_ref, address, expires_at) VALUES ($1,$2,$3,$4,$5)',
-        [id, cfg.INBOX_PROVIDER, ref, address, expires]);
-      reply.code(201);
-      return { inbox_id: id, address, expires_at: expires.toISOString() };
-    });
-  });
-
-  app.get<{ Params: { id: string } }>('/v1/inbox/:id/messages', async (req) => {
-    const [row] = await q<{ provider: 'stableemail' | 'agentmail'; provider_ref: string; address: string; expires_at: Date }>(
-      'SELECT provider, provider_ref, address, expires_at FROM inboxes WHERE id = $1', [req.params.id]);
-    if (!row || row.expires_at < new Date()) throw errors.notFound('inbox not found or expired');
-    const p = PROVIDERS.inbox[row.provider];
-    const j = (await upstreamJson(await mppFetch('inbox', p.messages(row.provider_ref), { method: 'GET' }))) as any;
-    return { address: row.address, expires_at: row.expires_at, messages: j.messages ?? j.data ?? j };
-  });
+  // ---- anonymous inbox (30 days): src/routes/inbox.ts ----
 }

@@ -12,6 +12,7 @@ import { checkDbNetwork } from '../migrate.js';
 import { refreshPrice } from '../services/prices.js';
 import { reserveBooks } from '../services/reserve.js';
 import { floatTick } from '../treasury/float.js';
+import { expireInboxes } from '../routes/inbox.js';
 
 const QUEUE = 'treasury';
 const PREFIX = keys.queuePrefix;
@@ -43,7 +44,6 @@ export async function housekeeping(): Promise<void> {
         AND NOT EXISTS (SELECT 1 FROM deposit_sightings s WHERE s.intent_id = deposit_intents.id)
         AND NOT EXISTS (SELECT 1 FROM deposits d WHERE d.intent_id = deposit_intents.id AND d.status = 'confirmed') RETURNING 1`),
     q(`DELETE FROM daily_tags WHERE day < $1 RETURNING 1`, [Math.floor(Date.now() / 86_400_000) - 2]),
-    q(`DELETE FROM inboxes WHERE expires_at < now() RETURNING 1`),
     q(`DELETE FROM vault_items WHERE expires_at IS NOT NULL AND expires_at < now() RETURNING 1`),
     // Only withdrawals whose tranches exist and are all confirmed; never one still converting.
     q(`UPDATE withdrawals w SET payout_addr_enc = NULL, status = 'done' WHERE payout_addr_enc IS NOT NULL
@@ -52,7 +52,8 @@ export async function housekeeping(): Promise<void> {
         AND NOT EXISTS (SELECT 1 FROM payouts p WHERE p.withdrawal_id = w.id AND p.status <> 'confirmed') RETURNING 1`),
     q(`DELETE FROM upstream_daily WHERE day < now() - interval '400 days' RETURNING 1`),
   ]);
-  log.info({ changed: r.map((x) => x.length) }, 'housekeeping');
+  const inboxes = await expireInboxes().catch((e) => (log.warn({ err: (e as Error).message }, 'inbox expiry failed'), 0));
+  log.info({ changed: r.map((x) => x.length), inboxes }, 'housekeeping');
 }
 
 const handlers: Record<string, () => Promise<unknown>> = {

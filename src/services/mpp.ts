@@ -102,7 +102,20 @@ function mockResponse(service: string, url: string): Response {
     research: { run_id: 'mock-run', status: 'completed', output: { content: 'mock research report', citations: [] } },
     health: { results: [{ name: 'mock', summary: 'mock record' }] },
     rpc: { jsonrpc: '2.0', id: 1, result: '0x1' },
-    inbox: { id: `mock-${Date.now()}`, address: `mock-${Date.now()}@example.com`, messages: [] },
+    inbox: { inbox_id: `mock-${Date.now()}@example.com`, email: `mock-${Date.now()}@example.com`, inbox: `mock-${Date.now()}@example.com` },
+    'inbox-send': { message_id: `mock-sent-${Date.now()}`, thread_id: 'mock-thread-1', messageId: `mock-sent-${Date.now()}` },
+    'inbox-delete': { success: true },
   };
+  if (service === 'inbox-read') {
+    const msg = {
+      message_id: 'mock-msg-1', id: 'mock-msg-1', thread_id: 'mock-thread-1', from: 'Zeep test <hello@example.com>', to: ['you@example.com'],
+      subject: 'Welcome to your Zeep inbox', preview: 'This is a mock message (MPP_MODE=mock).',
+      text: 'This is a mock message (MPP_MODE=mock).\n\nReal mail arrives here on a live network.',
+      html: '<p>This is a mock message (MPP_MODE=mock).</p><p>Real mail arrives here on a live network.</p>',
+      timestamp: new Date().toISOString(), receivedAt: new Date().toISOString(), labels: ['received', 'unread'], read: false, attachments: [],
+    };
+    const one = /\/messages\/[^/?]+$|\/messages\/read$/.test(new URL(url).pathname);
+    return Response.json(one ? { ...msg, message: msg } : { count: 1, messages: [msg] });
+  }
   return Response.json(body[service] ?? { ok: true, url });
 }
