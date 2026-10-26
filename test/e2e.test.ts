@@ -306,6 +306,23 @@ test('safety: two payments to one deposit address become one credit plus a claim
   await settleFloat();
 });
 
+test('a later payment to an already-credited address is found by pollDeposits() and claimed', { timeout: 120_000 }, async () => {
+  const d = await alice.startDeposit(3_000_000n);
+  await payInto(d.address, 3_000_000);
+  await until(async () => !!(await alice.depositStatus(d.slot)).credited);
+  assert.ok(!alice.book.pendingDeposits.includes(d.slot));
+  assert.ok(alice.book.watchedDeposits[d.slot] > Date.now()); // still watched
+  const zec0 = alice.balance(ZEC);
+  await payInto(d.address, 1_000_000); // someone reuses the address later
+  await until(async () => {
+    alice.book.lastWatchCheck = 0; // the app polls every few seconds; the watch runs every 10 min
+    await alice.pollDeposits();
+    return alice.balance(ZEC) === zec0 + 500_000n;
+  });
+  await sleep(1500);
+  await settleFloat();
+});
+
 test('daily deposit limit: a payment over it shows as queued until the next UTC day, never stuck', { timeout: 120_000 }, async () => {
   const [{ z }] = await q<{ z: string }>(`SELECT COALESCE(SUM(amount_zats),0) AS z FROM deposits WHERE status = 'credited' AND credited_on = CURRENT_DATE`);
   const c = cfg as { MAX_DEPOSIT_ZATS_PER_DAY?: number };

@@ -492,7 +492,13 @@ impl Chain for LightClient {
             .await?;
         let by_index: HashMap<u128, String> = rows.into_iter().map(|(a, i)| (u128::from(DEPOSIT_INDEX_BASE) + i as u128, a)).collect();
         let conn = rusqlite::Connection::open(&self.db_path)?;
-        // Outputs received at our deposit addresses from someone else (not our own change/sends).
+        // Every output received at one of our deposit addresses, INCLUDING ones the reserve wallet
+        // sent itself: a Zeep withdrawal paid to a Zeep deposit address (moving between two Zeep
+        // accounts) is a send from this wallet to itself, and must be credited like any deposit.
+        // `is_change` can't be used: the scanner marks every output of a transaction this wallet
+        // also spent from as change, including that self-payment. Real change never lands here:
+        // it goes to internal-scope addresses (key_scope 1), and deposit addresses are matched by
+        // their external diversifier index (>= DEPOSIT_INDEX_BASE) below.
         let mut stmt = conn.prepare(
             "SELECT a.diversifier_index_be, t.txid, ro.pool, ro.output_index, ro.value, t.mined_height
                FROM v_received_outputs ro
@@ -500,7 +506,7 @@ impl Chain for LightClient {
                JOIN addresses a ON a.id = ro.address_id
               WHERE ro.account_id = (SELECT id FROM accounts WHERE uuid = ?1)
                 AND a.key_scope = 0 AND a.diversifier_index_be IS NOT NULL
-                AND ro.is_change = 0 AND ro.sent_note_id IS NULL AND ro.pool IN (2, 3, 4)",
+                AND ro.pool IN (2, 3, 4)",
         )?;
         let found = stmt.query_map([self.account.expose_uuid().as_bytes().to_vec()], |r| {
             Ok((

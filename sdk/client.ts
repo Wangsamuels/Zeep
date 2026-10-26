@@ -503,6 +503,8 @@ export class ZeepClient {
     }
     const settled = st.status === "credited" || (st.status === "expired" && !st.confirming.length && !st.queued);
     if (settled && this.book.pendingDeposits.includes(slot)) this.book.pendingDeposits = this.book.pendingDeposits.filter((s) => s !== slot);
+    // Keep an eye on a credited address for a while: a second payment to it needs a claim.
+    if (st.status === "credited" && this.book.watchedDeposits[slot] === undefined) this.book.watchedDeposits[slot] = Date.now() + WATCH_MS;
     if (c || settled) await this.changed();
     if (st.unclaimed_zats > 0 && opts.claim !== false) {
       // Money sent twice to one address: move it to a new slot and poll that one too.
@@ -516,6 +518,20 @@ export class ZeepClient {
   async pollDeposits(): Promise<Map<number, DepositStatus>> {
     const out = new Map<number, DepositStatus>();
     for (const slot of [...this.book.pendingDeposits]) out.set(slot, await this.depositStatus(slot));
+    // Credited addresses: every 10 minutes, look for a second payment (claimed into a new slot).
+    const now = Date.now();
+    if (now - this.book.lastWatchCheck >= WATCH_EVERY_MS) {
+      this.book.lastWatchCheck = now;
+      for (const [k, until] of Object.entries(this.book.watchedDeposits)) {
+        const slot = Number(k);
+        if (until < now) {
+          delete this.book.watchedDeposits[slot];
+          continue;
+        }
+        if (!out.has(slot)) out.set(slot, await this.depositStatus(slot));
+      }
+      await this.changed();
+    }
     return out;
   }
 
@@ -712,5 +728,7 @@ export function solvePow(intentId: string, bits: number): string {
   }
 }
 
+const WATCH_MS = 30 * 86_400_000;
+const WATCH_EVERY_MS = 10 * 60_000;
 const utcDay = (): number => Math.floor(Date.now() / 86_400_000);
 const toZats = (micro: bigint, zecUsd: number): bigint => (micro <= 0n ? 0n : BigInt(Math.floor((Number(micro) / 1e6 / zecUsd) * 1e8)));

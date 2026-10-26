@@ -91,23 +91,30 @@ export class NoteBook {
   refill: RefillState = { base: "0", stage: 0 };
   /** Deposit slots still to poll (not credited yet), including claims of a second payment. */
   pendingDeposits: number[] = [];
+  /**
+   * Credited deposit addresses still watched for a second payment (someone reusing the
+   * address): slot → watch-until (ms). Checked at most every 10 minutes for 30 days.
+   */
+  watchedDeposits: Record<number, number> = {};
+  lastWatchCheck = 0;
   /** UTC day (days since epoch) of this device's last withdrawal: first-of-day fee estimate. */
   lastWithdrawalDay = -1;
 
-  static from(json: { notes: Note[]; nextDeposit: number; refill?: RefillState; pendingDeposits?: number[]; lastWithdrawalDay?: number } | null | undefined): NoteBook {
+  static from(json: { notes: Note[]; nextDeposit: number; refill?: RefillState; pendingDeposits?: number[]; lastWithdrawalDay?: number; watchedDeposits?: Record<number, number> } | null | undefined): NoteBook {
     const b = new NoteBook();
     if (json) {
       b.notes = json.notes.map((n) => ({ ...n, asset: (n.asset ?? USD) as Asset, pending: false }));
       b.nextDeposit = json.nextDeposit;
       if (json.refill) b.refill = json.refill;
       if (json.pendingDeposits) b.pendingDeposits = json.pendingDeposits;
+      if (json.watchedDeposits) b.watchedDeposits = json.watchedDeposits;
       if (json.lastWithdrawalDay !== undefined) b.lastWithdrawalDay = json.lastWithdrawalDay;
     }
     return b;
   }
 
   toJSON() {
-    return { notes: this.notes.filter((n) => !n.spent), nextDeposit: this.nextDeposit, refill: this.refill, pendingDeposits: this.pendingDeposits, lastWithdrawalDay: this.lastWithdrawalDay };
+    return { notes: this.notes.filter((n) => !n.spent), nextDeposit: this.nextDeposit, refill: this.refill, pendingDeposits: this.pendingDeposits, lastWithdrawalDay: this.lastWithdrawalDay, watchedDeposits: this.watchedDeposits };
   }
 
   /** Spendable balance of one asset: micro-USD (USD) or zats (ZEC). */

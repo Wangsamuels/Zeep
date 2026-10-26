@@ -14,4 +14,4 @@ vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com" }
 
 [env.mainnet]
 name = "zeep-relay-mainnet"
-vars = { ORIGIN = "https://REPLACE-zeep-main.herokuapp.com" }
+vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com" }  # same Heroku app, converted to mainnet

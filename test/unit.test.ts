@@ -57,8 +57,17 @@ test('testnet and mainnet can never be mixed up by configuration', () => {
   assert.match(networkProblems({ ...main, TREASURY_RAILS: 'live', RELAY_API_KEY: undefined }).join(), /RELAY_API_KEY/);
   // Testnet can never move real money.
   assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test', TREASURY_RAILS: 'live' }).join(), /TREASURY_RAILS=mock/);
-  assert.deepEqual(networkProblems({ ...main, TREASURY_RAILS: 'live', RELAY_API_KEY: 'k', MPP_MODE: 'live', SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
-    ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100), ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33) }), []);
+  const ready = { ...main, TREASURY_RAILS: 'live' as const, RELAY_API_KEY: 'k', MPP_MODE: 'live' as const, SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
+    ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100), ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33),
+    TEMPO_PRIVATE_KEY: '0x' + '1'.repeat(64), NEAR_ONECLICK_JWT: 'jwt', CORS_ALLOWED_ORIGINS: ['https://zeep.app'],
+    MODAL_LLM_BASE_URL: 'https://m.modal.run', MODAL_PROXY_TOKEN: 't' };
+  assert.deepEqual(networkProblems(ready), []);
+  // Mainnet refuses to boot without the keys its money path and services need.
+  assert.match(networkProblems({ ...ready, TEMPO_PRIVATE_KEY: undefined }).join(), /TEMPO_PRIVATE_KEY/);
+  assert.match(networkProblems({ ...ready, NEAR_ONECLICK_JWT: undefined }).join(), /NEAR_ONECLICK_JWT/);
+  assert.match(networkProblems({ ...ready, CORS_ALLOWED_ORIGINS: ['http://localhost:3001'] }).join(), /CORS_ALLOWED_ORIGINS/);
+  assert.match(networkProblems({ ...ready, MODAL_LLM_BASE_URL: '' }).join(), /MODAL_LLM_BASE_URL/);
+  assert.deepEqual(networkProblems({ ...ready, MODAL_LLM_BASE_URL: '', MODELS_JSON: ready.MODELS_JSON.filter((m) => m.host !== 'zeep') }), []);
 });
 
 test('public reserve books are rounded so single payments cannot be read off them', () => {

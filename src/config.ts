@@ -254,6 +254,15 @@ export function networkProblems(c: Config): string[] {
     if (c.ALLOW_PRICE_FALLBACK) p.push('ALLOW_PRICE_FALLBACK is not allowed on mainnet');
     if (!c.REQUIRE_RELAY && !c.ALLOW_NO_RELAY) p.push('mainnet needs REQUIRE_RELAY=true (or ALLOW_NO_RELAY=true to accept that Heroku logs client IPs)');
     if (/testnet|localhost|127\.0\.0\.1/.test(c.PUBLIC_API_BASE_URL)) p.push('PUBLIC_API_BASE_URL looks like a testnet/local URL');
+    // Everything the live money path and paid services need, checked at boot instead of failing
+    // on the first user's request.
+    if (!c.TEMPO_PRIVATE_KEY) p.push('mainnet needs TEMPO_PRIVATE_KEY (treasury EVM key: pays MPP services, moves the float)');
+    if (!c.NEAR_ONECLICK_JWT) p.push('mainnet needs NEAR_ONECLICK_JWT (live ZEC price and treasury swaps)');
+    if (c.CORS_ALLOWED_ORIGINS.some((o) => /localhost|127\.0\.0\.1/.test(o))) p.push('CORS_ALLOWED_ORIGINS must be your mainnet frontend URL');
+    const selfHosted = c.MODELS_JSON.some((m) => m.host === 'zeep');
+    if (selfHosted && (!c.MODAL_LLM_BASE_URL || !c.MODAL_PROXY_TOKEN)) {
+      p.push('mainnet lists self-hosted models: set MODAL_LLM_BASE_URL and MODAL_PROXY_TOKEN (or remove them from MODELS_JSON)');
+    }
   }
   return p;
 }
