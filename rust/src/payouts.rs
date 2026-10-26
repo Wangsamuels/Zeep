@@ -22,7 +22,13 @@ pub async fn tick(cfg: &Config, pool: &PgPool, chain: &mut dyn Chain, key: &str)
         .execute(pool)
         .await?;
     if bal.total_zats > cfg.reserve_hot_cap_zats {
-        warn!(balance = bal.total_zats, cap = cfg.reserve_hot_cap_zats, "hot reserve above cap; sweep excess to cold storage");
+        // Once an hour, not every tick (it would bury every other log line).
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) >= 3600 {
+            LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+            warn!(balance = bal.total_zats, cap = cfg.reserve_hot_cap_zats, "hot reserve above cap; sweep excess to cold storage");
+        }
     }
     // ZEC coming back from NEAR Intents lands on the reserve's transparent address: shield it.
     if bal.transparent_zats >= cfg.shield_min_zats {
