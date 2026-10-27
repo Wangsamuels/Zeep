@@ -186,6 +186,25 @@ test('metered frontier model: the app pays exactly the SDK price; a cheaper proo
   }
 });
 
+test("the user's own daily limit: default $5, adjustable, counted only for payments that went through", { timeout: 120_000 }, async () => {
+  assert.equal(alice.dailySpending().limit, 5_000_000n);
+  const searchCost = BigInt((await alice.prices()).routes.search.micro_usd);
+  const spent0 = alice.dailySpending().spent;
+  const ok = await alice.pay('POST', '/v1/search', JSON.stringify({ query: 'limit check' }), searchCost);
+  assert.equal(ok.status, 200);
+  assert.equal(alice.dailySpending().spent, spent0 + searchCost);
+  // Lower the limit below today's spending plus one search: the next one is refused on the device.
+  await alice.setDailyLimit(spent0 + searchCost + searchCost / 2n);
+  const before = alice.balance(USD);
+  await assert.rejects(alice.pay('POST', '/v1/search', JSON.stringify({ query: 'over' }), searchCost), /daily spending limit/);
+  assert.equal(alice.balance(USD), before); // nothing spent
+  await alice.setDailyLimit(0n); // no limit
+  assert.equal(alice.dailySpending().left, null);
+  const again = await alice.pay('POST', '/v1/search', JSON.stringify({ query: 'no limit' }), searchCost);
+  assert.equal(again.status, 200);
+  await alice.setDailyLimit(5_000_000n);
+});
+
 test('replays are refused (409) and underpaying is refused (402) without losing money', { timeout: 120_000 }, async () => {
   const prices = await alice.prices();
   const cost = BigInt(prices.routes.search.micro_usd);

@@ -97,10 +97,17 @@ export class NoteBook {
    */
   watchedDeposits: Record<number, number> = {};
   lastWatchCheck = 0;
+  /**
+   * The user's own daily spending limit on paid services (AI, search, inbox, …), in micro-USD.
+   * Kept on this device only: the server never knows whose balance is whose. 0 = no limit.
+   */
+  dailyLimitMicro = "5000000";
+  /** What paid services cost today (UTC day number → micro-USD). */
+  spentToday: { day: number; micro: string } = { day: -1, micro: "0" };
   /** UTC day (days since epoch) of this device's last withdrawal: first-of-day fee estimate. */
   lastWithdrawalDay = -1;
 
-  static from(json: { notes: Note[]; nextDeposit: number; refill?: RefillState; pendingDeposits?: number[]; lastWithdrawalDay?: number; watchedDeposits?: Record<number, number> } | null | undefined): NoteBook {
+  static from(json: { notes: Note[]; nextDeposit: number; refill?: RefillState; pendingDeposits?: number[]; lastWithdrawalDay?: number; watchedDeposits?: Record<number, number>; dailyLimitMicro?: string; spentToday?: { day: number; micro: string } } | null | undefined): NoteBook {
     const b = new NoteBook();
     if (json) {
       b.notes = json.notes.map((n) => ({ ...n, asset: (n.asset ?? USD) as Asset, pending: false }));
@@ -108,13 +115,16 @@ export class NoteBook {
       if (json.refill) b.refill = json.refill;
       if (json.pendingDeposits) b.pendingDeposits = json.pendingDeposits;
       if (json.watchedDeposits) b.watchedDeposits = json.watchedDeposits;
+      if (json.dailyLimitMicro !== undefined) b.dailyLimitMicro = json.dailyLimitMicro;
+      if (json.spentToday) b.spentToday = json.spentToday;
       if (json.lastWithdrawalDay !== undefined) b.lastWithdrawalDay = json.lastWithdrawalDay;
     }
     return b;
   }
 
   toJSON() {
-    return { notes: this.notes.filter((n) => !n.spent), nextDeposit: this.nextDeposit, refill: this.refill, pendingDeposits: this.pendingDeposits, lastWithdrawalDay: this.lastWithdrawalDay, watchedDeposits: this.watchedDeposits };
+    return { notes: this.notes.filter((n) => !n.spent), nextDeposit: this.nextDeposit, refill: this.refill, pendingDeposits: this.pendingDeposits, lastWithdrawalDay: this.lastWithdrawalDay, watchedDeposits: this.watchedDeposits,
+      dailyLimitMicro: this.dailyLimitMicro, spentToday: this.spentToday };
   }
 
   /** Spendable balance of one asset: micro-USD (USD) or zats (ZEC). */
