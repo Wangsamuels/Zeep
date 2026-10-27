@@ -6,3 +6,5 @@ export * from "./spend";
 export * from "./client";
 export * from "./units";
 export { MerkleTree, zeros } from "./tree";
+export * from "./ohttp-fetch";
+export { encodeKeyConfig, OhttpError, parseKeyConfig, type KeyConfig } from "./ohttp";

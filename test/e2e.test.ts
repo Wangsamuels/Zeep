@@ -25,7 +25,10 @@ import { checkRedisNetwork } from '../src/lib/redis.js';
 import { checkDbNetwork } from '../src/migrate.js';
 import { reserveBooks } from '../src/services/reserve.js';
 import { housekeeping } from '../src/workers/treasury.js';
-import { chatCostMicro, deriveKeys, NoteBook, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
+import { chatCostMicro, deriveKeys, NoteBook, ohttpFetch, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
+import { innerHeaders, keyConfigs } from '../src/routes/ohttp.js';
+import { b64, decodeRequest, encodeKeyConfig, encodeRequest, parseKeyConfig, REQ_MEDIA, sealRequest } from '../src/lib/ohttp.js';
+const testKeyConfig = () => b64(keyConfigs()[0]);
 import { nodeProve } from './helpers/prove.js';
 
 const BIN = new URL('../rust/target/debug/', import.meta.url).pathname;
@@ -77,7 +80,11 @@ after(async () => {
 const phrase = generateMnemonic(wordlist, 256);
 const NET = process.env.ZEEP_ENV === 'mainnet' ? 'mainnet' : 'testnet';
 const keys = deriveKeys(seedFromPhrase(phrase), NET);
-const alice = new ZeepClient({ baseUrl: '', keys, book: new NoteBook(), prove: nodeProve });
+// ZEEP_E2E_OHTTP=1 runs every API call in this suite through Oblivious HTTP (and the server
+// refuses anything else), proving the whole product works with OHTTP on.
+const OHTTP = process.env.ZEEP_E2E_OHTTP === '1';
+const http: typeof fetch = (url, init) => (OHTTP ? ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig() }) : fetch)(url, init);
+const alice = new ZeepClient({ baseUrl: '', keys, book: new NoteBook(), prove: nodeProve, fetch: http });
 
 async function payInto(address: string, zats: number) {
   await q('INSERT INTO dev_incoming (txid, to_address, height, amount_zats) VALUES ($1, $2, $3, $4)', [
@@ -253,11 +260,11 @@ test('replays are refused (409) and underpaying is refused (402) without losing 
     baseUrl: base, keys, book: alice.book, prove: nodeProve,
     fetch: async (url, init) => {
       if (String(url).endsWith('/v1/search')) captured = { url: String(url), init: init! };
-      return fetch(url, init);
+      return http(url, init);
     },
   });
   assert.equal((await spy.pay('POST', '/v1/search', JSON.stringify({ query: 'replay me' }), cost)).status, 200);
-  assert.equal((await fetch(captured!.url, captured!.init)).status, 409);
+  assert.equal((await http(captured!.url, captured!.init)).status, 409);
   const before = alice.balances();
   const low = await alice.pay('POST', '/v1/search', JSON.stringify({ query: 'cheap' }), cost - 1n);
   assert.equal(low.status, 402);
@@ -468,7 +475,7 @@ test('network guard: every process refuses a database or Redis that belongs to t
 });
 
 test('restore from the 24 words alone finds both exact balances', { timeout: 120_000 }, async () => {
-  const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(phrase), NET), book: new NoteBook(), prove: nodeProve });
+  const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(phrase), NET), book: new NoteBook(), prove: nodeProve, fetch: http });
   await fresh.restore();
   assert.deepEqual(fresh.balances(), alice.balances());
   assert.ok(fresh.book.nextDeposit >= 2);
@@ -484,7 +491,7 @@ test('reserve: ZEC held covers ZEC owed, dollars held cover dollars owed, and th
   assert.ok(b.profit.conversion_fees_micro_usd > b.profit.conversion_costs_micro_usd, JSON.stringify(b.profit));
   assert.ok(b.profit.net_micro_usd > 0, JSON.stringify(b.profit));
   console.log('reserve', JSON.stringify({ zec: b.zec, usd: b.usd, coverage_pct: b.coverage_pct, profit: b.profit }));
-  const pub = await (await fetch(`${base}/v1/reserve`)).json();
+  const pub = await (await http(`${base}/v1/reserve`)).json();
   assert.equal(pub.usd.owed_micro_usd % 1_000_000, 0); // published rounded to $1
   assert.equal(pub.zec.owed_zats % 1_000_000, 0); // and 0.01 ZEC
 });
@@ -567,7 +574,7 @@ test('anonymous inbox: create, list, read the full letter, send, reply, delete; 
 
   // Unknown inbox: 404; the old GET route with the id in the path is gone.
   await assert.rejects(alice.inboxMessages('ibx_' + 'A'.repeat(32)), /not found/);
-  assert.equal((await fetch(`${base}/v1/inbox/${box.inbox_id}/messages`)).status, 404);
+  assert.equal((await http(`${base}/v1/inbox/${box.inbox_id}/messages`)).status, 404);
 
   // Daily send limit: refused without charging.
   const c = cfg as { INBOX_SENDS_PER_DAY: number };
@@ -591,12 +598,12 @@ test('encrypted vault: chat items with 30-day auto-delete, auth required', async
   const url = `${base}/v1/vault/items/chat-1`;
   const h = { 'content-type': 'application/json', 'x-vault-id': keys.vaultId, 'x-vault-auth': keys.vaultAuth };
   const expires = new Date(Date.now() + 30 * 86_400_000).toISOString();
-  assert.equal((await fetch(url, { method: 'PUT', headers: h, body: JSON.stringify({ blob: 'AAAA', expires_at: expires }) })).status, 204);
-  assert.equal((await (await fetch(url, { headers: h })).json()).blob, 'AAAA');
-  assert.equal((await fetch(url, { headers: { ...h, 'x-vault-auth': 'f'.repeat(64) } })).status, 401);
+  assert.equal((await http(url, { method: 'PUT', headers: h, body: JSON.stringify({ blob: 'AAAA', expires_at: expires }) })).status, 204);
+  assert.equal((await (await http(url, { headers: h })).json()).blob, 'AAAA');
+  assert.equal((await http(url, { headers: { ...h, 'x-vault-auth': 'f'.repeat(64) } })).status, 401);
   await q(`UPDATE vault_items SET expires_at = now() - interval '1 second'`);
-  assert.equal((await fetch(url, { headers: h })).status, 404);
-  assert.equal((await fetch(`${base}/v1/vault`, { method: 'DELETE', headers: h })).status, 204);
+  assert.equal((await http(url, { headers: h })).status, 404);
+  assert.equal((await http(`${base}/v1/vault`, { method: 'DELETE', headers: h })).status, 204);
 });
 
 // ------------------------------------------------------------------ adversarial: money-loss channels
@@ -609,12 +616,12 @@ const svcBooks = async () => {
 /** A fetch that records every request, so a test can replay the exact bytes (proof headers included). */
 function recorder() {
   const sent: { url: string; init: RequestInit }[] = [];
-  const f = ((url: string, init: RequestInit = {}) => { sent.push({ url, init }); return fetch(url, init); }) as typeof fetch;
+  const f = ((url: string, init: RequestInit = {}) => { sent.push({ url, init }); return http(url, init); }) as typeof fetch;
   return { sent, f };
 }
 /** A fetch that withholds the paid request (keeping its exact bytes) and passes everything else through. */
 const holdProof = (keep: (c: { url: string; init: RequestInit }) => void) => (async (url: string, init: RequestInit = {}) => {
-  if (!(init.headers as Record<string, string> | undefined)?.['x-zeep-proof']) return fetch(url, init);
+  if (!(init.headers as Record<string, string> | undefined)?.['x-zeep-proof']) return http(url, init);
   keep({ url, init });
   return new Response('{"error":{"code":"held","message":"held by the test"}}', { status: 599 });
 }) as typeof fetch;
@@ -638,7 +645,7 @@ test('adversarial: the same paid request sent twice at once is charged once and 
   assert.equal(r1.status, 200);
   const last = rec.sent[rec.sent.length - 1];
   // Replay the identical bytes twice in parallel (a malicious client or a retrying proxy).
-  const [a, b] = await Promise.all([fetch(last.url, last.init), fetch(last.url, last.init)]);
+  const [a, b] = await Promise.all([http(last.url, last.init), http(last.url, last.init)]);
   assert.deepEqual([a.status, b.status], [409, 409]);
   const after = await svcBooks();
   assert.equal(after.service - before.service, cost); // one charge
@@ -654,7 +661,7 @@ test('adversarial: two simultaneous first uses of one proof → exactly one succ
     fetch: holdProof((c) => (captured = c)) });
   await hold.pay('POST', '/v1/search', JSON.stringify({ query: 'twin' }), cost).catch(() => {});
   assert.ok(captured);
-  const rs = await Promise.all([fetch(captured!.url, captured!.init), fetch(captured!.url, captured!.init)]);
+  const rs = await Promise.all([http(captured!.url, captured!.init), http(captured!.url, captured!.init)]);
   assert.deepEqual(rs.map((r) => r.status).sort(), [200, 409]);
   const after = await svcBooks();
   assert.equal(after.service - before.service, cost);
@@ -671,13 +678,13 @@ test('adversarial: a proof is bound to its route and body (no reuse elsewhere, n
   await hold.pay('POST', '/v1/search', JSON.stringify({ query: 'cheap' }), cost).catch(() => {});
   const h = captured!.init.headers as Record<string, string>;
   // Same proof, different body (a longer query) and different routes (research, an AI reply).
-  const other = await fetch(`${base}/v1/search`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'something else entirely' }) });
-  const research = await fetch(`${base}/v1/research`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'cheap', processor: 'pro' }) });
-  const chat = await fetch(`${base}/v1/ai/chat/completions`, { method: 'POST', headers: h, body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }) });
+  const other = await http(`${base}/v1/search`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'something else entirely' }) });
+  const research = await http(`${base}/v1/research`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'cheap', processor: 'pro' }) });
+  const chat = await http(`${base}/v1/ai/chat/completions`, { method: 'POST', headers: h, body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }) });
   for (const r of [other, research, chat]) assert.ok([401, 402, 422].includes(r.status), `status ${r.status}`); // refused before any note is burnt
   assert.equal((await svcBooks()).service, before.service); // nothing charged
   // The untouched proof still works exactly once for its own request.
-  const ok = await fetch(captured!.url, captured!.init);
+  const ok = await http(captured!.url, captured!.init);
   assert.equal(ok.status, 200);
   // The app never saw that reply, so it lost track of its change; the 24 words get it back.
   await mallory.restore();
@@ -710,7 +717,7 @@ test('adversarial: a failed upstream refunds exactly once; replaying the failed 
   assert.equal(failed!.status, 503);
   assert.equal(mallory.balance(USD), usd0); // refunded as a new note
   const last = rec.sent[rec.sent.length - 1];
-  const replay = await fetch(last.url, last.init); // budget is back: try to get it served for free
+  const replay = await http(last.url, last.init); // budget is back: try to get it served for free
   assert.equal(replay.status, 409);
   const after = await svcBooks();
   assert.equal(after.compN - before.compN, 1);
@@ -722,7 +729,7 @@ test('adversarial: two devices spend the same notes at once (service + withdrawa
   await mallory.refreshSpent();
   // Device B: a copy of mallory's book (same 24 words on a second device).
   const bookB = NoteBook.from(JSON.parse(JSON.stringify(mallory.book.toJSON())));
-  const deviceB = new ZeepClient({ baseUrl: base, keys: mKeys, book: bookB, prove: nodeProve });
+  const deviceB = new ZeepClient({ baseUrl: base, keys: mKeys, book: bookB, prove: nodeProve, fetch: http });
   const usd = mallory.balance(USD);
   const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
   const plan = await deviceB.planWithdrawal('all');
@@ -780,4 +787,120 @@ test('privacy: no IP, user agent or client header reaches a handler, a log or th
   const logged = lines.join('');
   assert.ok(logged.includes('"route":"/v1/status"'), 'the request was logged (route/status/latency only)');
   for (const s of ['198.51.100', 'SecretBrowser', 'alice-laptop', 'xx-SECRET']) assert.ok(!logged.includes(s), `log leaked ${s}`);
+});
+
+// ------------------------------------------------------------------ Oblivious HTTP
+/** What the relay would see: every outer request and reply, as bytes. */
+function relayView() {
+  const seen: { path: string; reqBytes: number; resBytes: number; status: number }[] = [];
+  const net = (async (url: string, init: RequestInit) => {
+    const r = await fetch(url, init);
+    const buf = new Uint8Array(await r.arrayBuffer());
+    seen.push({ path: new URL(url).pathname, reqBytes: (init.body as Uint8Array).length, resBytes: buf.length, status: r.status });
+    return new Response(buf, { status: r.status, headers: r.headers });
+  }) as typeof fetch;
+  return { seen, net };
+}
+const isBucket = (n: number) => n === 1024 || (n <= 65536 && (n & (n - 1)) === 0) || n % 65536 === 0;
+
+test('ohttp: the relay sees only POST /ohttp with padded sizes; the reply matches the plain one', { timeout: 60_000 }, async () => {
+  const view = relayView();
+  const zf = ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig(), fetch: view.net });
+  const r = await zf(`${base}/v1/prices`);
+  assert.equal(r.status, 200);
+  const viaOhttp = await r.json();
+  assert.ok(viaOhttp.routes?.search, 'real API reply inside');
+  // Two different requests: the relay sees the same path and the same padded sizes.
+  await zf(`${base}/v1/config`);
+  await zf(`${base}/v1/vault/items`, { headers: { 'x-vault-id': 'a'.repeat(64), 'x-vault-auth': 'b'.repeat(64) } });
+  for (const s of view.seen) {
+    assert.equal(s.path, '/ohttp');
+    assert.ok(isBucket(s.reqBytes), `request size ${s.reqBytes} is a bucket`);
+    assert.ok(isBucket(s.resBytes), `reply size ${s.resBytes} is a bucket`);
+  }
+  assert.equal(new Set(view.seen.map((s) => s.reqBytes)).size, 1, 'different routes, same request size');
+});
+
+test('ohttp: tampering, an unknown key, a cut reply and forbidden inner paths all fail closed', { timeout: 60_000 }, async () => {
+  // A relay flipping one bit of the request.
+  const flip = (async (url: string, init: RequestInit) => {
+    const b = new Uint8Array(init.body as Uint8Array);
+    b[b.length - 5] ^= 1;
+    return fetch(url, { ...init, body: b });
+  }) as typeof fetch;
+  const t = await ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig(), fetch: flip })(`${base}/v1/prices`);
+  assert.equal(t.status, 400);
+  assert.equal((await t.json()).error.code, 'ohttp_decrypt');
+  // A key the server doesn't have.
+  const other = b64(encodeKeyConfig(9, new Uint8Array(32).fill(5).map((x, i) => x + i)));
+  const k = await ohttpFetch({ baseUrl: base, keyConfig: other })(`${base}/v1/prices`);
+  assert.equal(k.status, 422);
+  // A relay cutting the reply short: the app must notice, never accept a partial answer.
+  const cut = (async (url: string, init: RequestInit) => {
+    const r = await fetch(url, init);
+    const buf = new Uint8Array(await r.arrayBuffer());
+    return new Response(buf.subarray(0, buf.length - 3), { status: r.status, headers: r.headers });
+  }) as typeof fetch;
+  await assert.rejects(async () => {
+    const r = await ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig(), fetch: cut })(`${base}/v1/prices`);
+    await r.text();
+  });
+  // Only /v1/ routes run inside the gateway: no internal routes, no nesting.
+  for (const path of ['/internal/x', '/ohttp', '/v1/../internal/x']) {
+    const sealed = sealRequest(parseKeyConfig(testKeyConfig()), encodeRequest('GET', path, [], new Uint8Array(0)));
+    const r = await fetch(`${base}/ohttp`, { method: 'POST', headers: { 'content-type': REQ_MEDIA }, body: sealed.body });
+    assert.equal(r.status, 400, path);
+  }
+  // The app can't call anything but Zeep through it (no accidental plain-text leaks).
+  await assert.rejects(ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig() })('https://example.com/v1/prices'));
+});
+
+test('ohttp: smuggled identity headers inside the encrypted request never reach a handler', { timeout: 60_000 }, async () => {
+  const smuggled: [string, string][] = [
+    ['x-forwarded-for', '198.51.100.9'], ['cf-connecting-ip', '198.51.100.9'], ['forwarded', 'for=198.51.100.9'], ['user-agent', 'Leaky/1.0'],
+    ['cookie', 'id=alice'], ['accept-language', 'xx-SECRET'], ['x-zeep-ohttp-inner', 'guess'], ['x-zeep-relay', 'guess'],
+    ['content-type', 'application/json'], ['x-zeep-proof', 'p'], ['x-vault-id', 'v'],
+  ];
+  const h = innerHeaders(smuggled);
+  assert.deepEqual(Object.keys(h).filter((k) => !['x-zeep-ohttp-inner', 'x-zeep-relay'].includes(k)).sort(), ['content-type', 'x-vault-id', 'x-zeep-proof']);
+  assert.notEqual(h['x-zeep-ohttp-inner'], 'guess');
+  assert.ok(!JSON.stringify(h).includes('198.51.100') && !JSON.stringify(h).includes('Leaky') && !JSON.stringify(h).includes('SECRET'));
+  // And a real request carrying them still works normally.
+  const zf = ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig() });
+  assert.equal((await zf(`${base}/v1/status`, { headers: Object.fromEntries(smuggled.slice(0, 8)) })).status, 200);
+});
+
+test('ohttp: REQUIRE_OHTTP refuses plain calls, still serves OHTTP and the status page', { timeout: 60_000 }, async () => {
+  const c = cfg as { REQUIRE_OHTTP: boolean };
+  const saved = c.REQUIRE_OHTTP;
+  c.REQUIRE_OHTTP = true;
+  try {
+    const plain = await fetch(`${base}/v1/prices`);
+    assert.equal(plain.status, 403);
+    assert.equal((await plain.json()).error.code, 'ohttp_required');
+    assert.equal((await fetch(`${base}/v1/status`)).status, 200);
+    // A guessed inner marker from outside doesn't work.
+    assert.equal((await fetch(`${base}/v1/prices`, { headers: { 'x-zeep-ohttp-inner': 'f'.repeat(64) } })).status, 403);
+    const viaOhttp = await ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig() })(`${base}/v1/prices`);
+    assert.equal(viaOhttp.status, 200);
+  } finally {
+    c.REQUIRE_OHTTP = saved;
+  }
+});
+
+test('ohttp: a streamed AI reply arrives intact, in padded batches, with nothing cut', { timeout: 120_000 }, async () => {
+  const zf = ohttpFetch({ baseUrl: base, keyConfig: testKeyConfig() });
+  const bob = new ZeepClient({ baseUrl: base, keys: mKeys, book: mallory.book, prove: nodeProve, fetch: zf });
+  const p = await bob.prices();
+  const model = p.models.find((m: { metered: unknown }) => !m.metered) ?? p.models[0];
+  const chat = JSON.stringify({ model: model.id, stream: true, messages: [{ role: 'user', content: 'hi' }] });
+  const cost = model.metered ? chatCostMicro(p, model.id, chat) : BigInt(model.micro_usd);
+  const r = await bob.pay('POST', '/v1/ai/chat/completions', chat, cost);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-type') ?? '', /text\/event-stream/);
+  const sse = await r.text();
+  assert.match(sse, /^: open/);
+  const text = [...sse.matchAll(/^data: (\{.*\})$/gm)].map((m) => JSON.parse(m[1]).choices[0].delta.content).join('');
+  assert.match(text, /mock reply/);
+  assert.match(sse, /data: \[DONE\]/);
 });

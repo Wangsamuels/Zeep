@@ -32,6 +32,15 @@ const Env = z.object({
   CORS_ALLOWED_ORIGINS: csv('http://localhost:3001'),
   RELAY_SHARED_SECRET: z.string().optional(),
   REQUIRE_RELAY: bool(false),
+  // Oblivious HTTP: requests are encrypted to this key, so the relay sees only ciphertext.
+  // 32 random bytes, base64 (openssl rand -base64 32). The public half goes in the frontend.
+  OHTTP_PRIVATE_KEY: z.string().optional(),
+  OHTTP_KEY_ID: z.coerce.number().int().min(0).max(255).default(1),
+  // Optional: the previous key, accepted while users still have the old frontend loaded.
+  OHTTP_PREVIOUS_PRIVATE_KEY: z.string().optional(),
+  OHTTP_PREVIOUS_KEY_ID: z.coerce.number().int().min(0).max(255).default(0),
+  // Refuse every API call that doesn't arrive through OHTTP (turn on once the frontend uses it).
+  REQUIRE_OHTTP: bool(false),
   INTERNAL_API_TOKEN: z.string().optional(),
   DB_POOL_MAX: int(10),
   REDIS_TLS_REJECT_UNAUTHORIZED: bool(false),
@@ -251,6 +260,12 @@ export function networkProblems(c: Config): string[] {
   if (c.INBOX_PROVIDER === 'stableemail' && (c.SERVICE_PRICES_USD_JSON.inbox ?? 0) < 1) {
     p.push('INBOX_PROVIDER=stableemail costs $1 per inbox: set "inbox" to at least 1.00 in SERVICE_PRICES_USD_JSON');
   }
+  for (const k of ['OHTTP_PRIVATE_KEY', 'OHTTP_PREVIOUS_PRIVATE_KEY'] as const) {
+    const v = c[k];
+    if (v && Buffer.from(v.trim(), 'base64').length !== 32) p.push(`${k} must be 32 random bytes in base64 (openssl rand -base64 32)`);
+  }
+  if (c.OHTTP_PREVIOUS_PRIVATE_KEY && c.OHTTP_PREVIOUS_KEY_ID === c.OHTTP_KEY_ID) p.push('OHTTP_PREVIOUS_KEY_ID must differ from OHTTP_KEY_ID');
+  if (c.REQUIRE_OHTTP && !c.OHTTP_PRIVATE_KEY) p.push('REQUIRE_OHTTP=true needs OHTTP_PRIVATE_KEY');
   if (!main) {
     // Testnet ZEC is free: it must never move real money. The rails are always simulated, and
     // real paid services only with an explicit opt-in (keep MPP_DAILY_BUDGET_USD small).
@@ -264,6 +279,7 @@ export function networkProblems(c: Config): string[] {
     if (!c.SPEND_VKEY_SHA256) p.push('mainnet needs SPEND_VKEY_SHA256 (pin the verifying key from the ceremony)');
     if (c.ALLOW_PRICE_FALLBACK) p.push('ALLOW_PRICE_FALLBACK is not allowed on mainnet');
     if (!c.REQUIRE_RELAY && !c.ALLOW_NO_RELAY) p.push('mainnet needs REQUIRE_RELAY=true (or ALLOW_NO_RELAY=true to accept that Heroku logs client IPs)');
+    if (!c.OHTTP_PRIVATE_KEY) p.push('mainnet needs OHTTP_PRIVATE_KEY (openssl rand -base64 32): requests are encrypted end to end through the relay');
     if (/testnet|localhost|127\.0\.0\.1/.test(c.PUBLIC_API_BASE_URL)) p.push('PUBLIC_API_BASE_URL looks like a testnet/local URL');
     // Everything the live money path and paid services need, checked at boot instead of failing
     // on the first user's request.

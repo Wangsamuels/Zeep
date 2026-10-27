@@ -156,6 +156,37 @@ Once steps 1–7 are done, Claude checks the live mainnet without spending money
 - the frontend build points at mainnet;
 - account creation and a fresh `u1…` deposit address.
 
+## 9. Oblivious HTTP (end-to-end encryption through the relay)
+
+Without it, Cloudflare sees each user's IP next to what they do. With it, Cloudflare sees only the IP and an encrypted, padded blob, and Zeep's server sees the request but never the IP.
+
+1. **Set the key before pushing the code** (mainnet refuses to start without it):
+
+   ```bash
+   heroku config:set -a zeep-test OHTTP_PRIVATE_KEY="$(openssl rand -base64 32)"
+   ```
+
+2. Push the code and wait for the release to finish.
+3. Print the public half for the frontend:
+
+   ```bash
+   heroku run -a zeep-test -- node dist/ohttp-config.js
+   ```
+
+   It prints `NEXT_PUBLIC_OHTTP_KEY_CONFIG=...`. Add that to Vercel (Production), then have the frontend agent apply `docs/FRONTEND_UPDATE_OHTTP.md` and redeploy.
+4. Once the new frontend works, refuse anything that isn't OHTTP:
+
+   ```bash
+   heroku config:set -a zeep-test REQUIRE_OHTTP=true
+   ```
+
+**Rotating the key:**
+
+- move the current key to `OHTTP_PREVIOUS_PRIVATE_KEY` with `OHTTP_PREVIOUS_KEY_ID=1`;
+- set a new `OHTTP_PRIVATE_KEY` with `OHTTP_KEY_ID=2`;
+- update Vercel and redeploy;
+- remove the previous key a day later.
+
 ## Safety limits (already set)
 
 | Setting | Value |

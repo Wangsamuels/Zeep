@@ -17,6 +17,7 @@ import publicRoutes from './routes/public.js';
 import inboxRoutes from './routes/inbox.js';
 import serviceRoutes from './routes/services.js';
 import vaultRoutes from './routes/vault.js';
+import { isInnerRequest, registerOhttp } from './routes/ohttp.js';
 
 // Headers that can carry a client IP. Removed before any handler or log sees them.
 const IP_HEADERS = ['x-forwarded-for', 'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip'];
@@ -54,6 +55,15 @@ export async function buildApp() {
       }
     }
     delete req.headers['x-zeep-relay'];
+    // Requests decrypted by the OHTTP gateway carry a per-process marker; nobody else can.
+    const inner = isInnerRequest(req.headers['x-zeep-ohttp-inner']);
+    delete req.headers['x-zeep-ohttp-inner'];
+    if (cfg.REQUIRE_OHTTP && !inner && req.method !== 'OPTIONS' && !req.url.startsWith('/internal/')) {
+      const path = req.url.split('?')[0];
+      if (path !== '/ohttp' && path !== '/ohttp-keys' && path !== '/v1/status') {
+        return reply.code(403).send({ error: { code: 'ohttp_required', message: 'this API only accepts Oblivious HTTP requests; update the app' } });
+      }
+    }
   });
 
   await app.register(cors, {
@@ -91,6 +101,7 @@ export async function buildApp() {
   await app.register(moneyRoutes);
   await app.register(vaultRoutes);
   await app.register(internalRoutes);
+  await registerOhttp(app);
   return app;
 }
 

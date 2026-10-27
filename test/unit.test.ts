@@ -17,6 +17,7 @@ import { CHAT_BYTES_PER_TOKEN, CHAT_IMAGE_TOKENS, CHAT_MESSAGE_TOKENS, chatMicro
 import { chatCostMicro, convertSignal, solvePow, decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
 import { buildSpend } from '../sdk/spend';
 import { CIRCUIT, nodeProve } from './helpers/prove.js';
+import * as ohttp from '../src/lib/ohttp.js';
 
 after(async () => {
   await (globalThis as { curve_bn128?: { terminate(): Promise<void> } }).curve_bn128?.terminate();
@@ -57,11 +58,13 @@ test('testnet and mainnet can never be mixed up by configuration', () => {
   assert.match(networkProblems({ ...main, TREASURY_RAILS: 'live', RELAY_API_KEY: undefined }).join(), /RELAY_API_KEY/);
   // Testnet can never move real money.
   assert.match(networkProblems({ ...base, ZEEP_ENV: 'testnet', ZCASH_NETWORK: 'test', TREASURY_RAILS: 'live' }).join(), /TREASURY_RAILS=mock/);
-  const ready = { ...main, TREASURY_RAILS: 'live' as const, RELAY_API_KEY: 'k', MPP_MODE: 'live' as const, SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true,
+  const ready = { ...main, TREASURY_RAILS: 'live' as const, RELAY_API_KEY: 'k', MPP_MODE: 'live' as const, SPEND_VKEY_SHA256: 'ab', ALLOW_PRICE_FALLBACK: false, REQUIRE_RELAY: true, OHTTP_PRIVATE_KEY: Buffer.alloc(32, 1).toString('base64'),
     ZEEP_RECEIVE_UA: 'u1' + 'q'.repeat(100), ZEEP_RESERVE_TADDR: 't1' + 'A'.repeat(33),
     TEMPO_PRIVATE_KEY: '0x' + '1'.repeat(64), NEAR_ONECLICK_JWT: 'jwt', CORS_ALLOWED_ORIGINS: ['https://zeep.app'],
     MODAL_LLM_BASE_URL: 'https://m.modal.run', MODAL_PROXY_TOKEN: 't' };
   assert.deepEqual(networkProblems(ready), []);
+  assert.match(networkProblems({ ...ready, OHTTP_PRIVATE_KEY: undefined }).join(), /OHTTP_PRIVATE_KEY/);
+  assert.match(networkProblems({ ...ready, OHTTP_PRIVATE_KEY: 'short' }).join(), /32 random bytes/);
   // Mainnet refuses to boot without the keys its money path and services need.
   assert.match(networkProblems({ ...ready, TEMPO_PRIVATE_KEY: undefined }).join(), /TEMPO_PRIVATE_KEY/);
   assert.match(networkProblems({ ...ready, NEAR_ONECLICK_JWT: undefined }).join(), /NEAR_ONECLICK_JWT/);
@@ -264,4 +267,81 @@ test('the SDK refuses a server on another network before sending anything key-de
   const c = new Client({ baseUrl: 'https://api.example', keys, book: new NoteBook(), prove: nodeProve, fetch: fakeFetch });
   await assert.rejects(c.depositStatus(0), /on mainnet, but these keys are for testnet/);
   assert.deepEqual(sent, ['https://api.example/v1/config']); // the intent id never left the device
+});
+
+// ------------------------------------------------------------------ OHTTP
+test('ohttp: the server and SDK share one identical implementation', () => {
+  assert.equal(readFileSync(new URL('../src/lib/ohttp.ts', import.meta.url), 'utf8'), readFileSync(new URL('../sdk/ohttp.ts', import.meta.url), 'utf8'));
+});
+
+test('ohttp: HPKE interoperates with an independent implementation (@hpke/core) both ways', async () => {
+  const { CipherSuite, Aes128Gcm, HkdfSha256 } = await import('@hpke/core');
+  const { DhkemX25519HkdfSha256 } = await import('@hpke/dhkem-x25519');
+  const suite = new CipherSuite({ kem: new DhkemX25519HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
+  const info = new TextEncoder().encode('zeep test info');
+  const aad = new TextEncoder().encode('aad');
+  const msg = new TextEncoder().encode('hello across implementations');
+  // Theirs → ours.
+  const rkp = await suite.kem.generateKeyPair();
+  const skRaw = new Uint8Array(await suite.kem.serializePrivateKey(rkp.privateKey));
+  const pkRaw = new Uint8Array(await suite.kem.serializePublicKey(rkp.publicKey));
+  assert.deepEqual(ohttp.publicKeyOf(skRaw), pkRaw);
+  const sender = await suite.createSenderContext({ recipientPublicKey: rkp.publicKey, info });
+  const ct = new Uint8Array(await sender.seal(msg, aad));
+  const mine = ohttp.setupBaseR(new Uint8Array(sender.enc), skRaw, info);
+  assert.deepEqual(mine.open(aad, ct), msg);
+  // Ours → theirs, and both exporters agree (the chunked-response keys come from it).
+  const { enc, ctx } = ohttp.setupBaseS(pkRaw, info);
+  const ct2 = ctx.seal(aad, msg);
+  const recipient = await suite.createRecipientContext({ recipientKey: rkp, enc, info });
+  assert.deepEqual(new Uint8Array(await recipient.open(ct2, aad)), msg);
+  const label = new TextEncoder().encode('message/bhttp chunked response');
+  assert.deepEqual(ctx.export(label, 16), new Uint8Array(await recipient.export(label, 16)));
+});
+
+test('ohttp: request and response round-trip; key configs parse; tampering is caught', () => {
+  const sk = new Uint8Array(32).fill(3);
+  const cfgBytes = ohttp.encodeKeyConfig(1, ohttp.publicKeyOf(sk));
+  assert.equal(cfgBytes.length, 41);
+  const key = ohttp.parseKeyConfig(ohttp.b64(cfgBytes));
+  assert.equal(key.keyId, 1);
+  assert.deepEqual(ohttp.parseKeyConfig(ohttp.encodeKeyConfigs([cfgBytes])).publicKey, key.publicKey);
+  const body = new TextEncoder().encode('{"query":"x"}');
+  const msg = ohttp.encodeRequest('POST', '/v1/search?x=1', [['content-type', 'application/json'], ['x-zeep-proof', 'abc']], body);
+  const { body: sealed, ctx, enc } = ohttp.sealRequest(key, msg);
+  assert.equal(sealed.length, ohttp.bucket(sealed.length)); // exactly a bucket size
+  const opened = ohttp.openRequest(sealed, (id) => (id === 1 ? sk : undefined));
+  const req = ohttp.decodeRequest(opened.plaintext);
+  assert.equal(req.method, 'POST');
+  assert.equal(req.path, '/v1/search?x=1');
+  assert.deepEqual(req.headers, [['content-type', 'application/json'], ['x-zeep-proof', 'abc']]);
+  assert.deepEqual(req.body, body);
+  // Response in three chunks, read back in odd-sized network pieces.
+  const w = ohttp.responseWriter(opened.ctx, opened.enc);
+  const wire = ohttp.concat(
+    w.nonce,
+    w.chunk(ohttp.concat(ohttp.encodeResponseHead(200, [['x-zeep-notes', 'n1']]), ohttp.encodeContent(new TextEncoder().encode('hel')))),
+    w.chunk(ohttp.encodeContent(new TextEncoder().encode('lo'))),
+    w.final(ohttp.encodeResponseEnd(40)),
+  );
+  const reader = new ohttp.ResponseReader(ctx, enc);
+  const parser = new ohttp.ResponseParser();
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < wire.length; i += 7) for (const pt of reader.push(wire.subarray(i, i + 7))) out.push(...parser.push(pt).content);
+  out.push(...parser.push(reader.end()).content);
+  assert.equal(parser.status, 200);
+  assert.deepEqual(parser.headers, [['x-zeep-notes', 'n1']]);
+  assert.equal(new TextDecoder().decode(ohttp.concat(...out)), 'hello');
+  assert.ok(parser.complete);
+  // Flipped bit in a chunk → refused; reply cut before the final chunk → refused.
+  const bad = wire.slice(); bad[30] ^= 1;
+  assert.throws(() => new ohttp.ResponseReader(ctx, enc).push(bad));
+  const cut = new ohttp.ResponseReader(ctx, enc);
+  cut.push(wire.subarray(0, wire.length - 60));
+  assert.throws(() => cut.end());
+  // Wrong key, wrong id, flipped request bit.
+  assert.throws(() => ohttp.openRequest(sealed, () => new Uint8Array(32).fill(4)));
+  assert.throws(() => ohttp.openRequest(sealed, () => undefined));
+  const flipped = sealed.slice(); flipped[60] ^= 1;
+  assert.throws(() => ohttp.openRequest(flipped, () => sk));
 });

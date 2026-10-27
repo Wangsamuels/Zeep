@@ -17,3 +17,7 @@ if (mainnet) {
 process.env.ZEEP_RESERVE_TADDR = (mainnet ? 't1' : 'tm') + 'ReserveDevAddressXXXXXXXXXXXXXXXX';
 process.env.DEV_GENESIS_UNIX = '1760000000';
 process.env.DEV_BLOCK_SECS = '1';
+// A fixed test OHTTP key (never used anywhere real). ZEEP_E2E_OHTTP=1 also makes the server
+// refuse every API call that doesn't come through OHTTP.
+process.env.OHTTP_PRIVATE_KEY ??= Buffer.alloc(32, 7).toString('base64');
+if (process.env.ZEEP_E2E_OHTTP === '1') process.env.REQUIRE_OHTTP = 'true';
