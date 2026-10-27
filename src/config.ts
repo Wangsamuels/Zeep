@@ -83,6 +83,15 @@ const Env = z.object({
         detail: z.string().default(''),
         upstream: z.string().optional(),
         testnet: z.boolean().default(true),
+        // Metered models (MPP gateways price each request upfront from its text and its output
+        // cap). With these set, a reply costs max(min_usd, input tokens × in + output cap × out),
+        // and the output cap is enforced on the request Zeep forwards. Without them: flat `usd`.
+        in_usd_per_m: z.number().nonnegative().optional(),
+        out_usd_per_m: z.number().nonnegative().optional(),
+        min_usd: z.number().nonnegative().default(0.012),
+        default_output: z.number().int().positive().default(4096),
+        max_output: z.number().int().positive().default(16_000),
+        gateway: z.enum(['openrouter', 'openai']).optional(),
       }),
     ),
     JSON.stringify([

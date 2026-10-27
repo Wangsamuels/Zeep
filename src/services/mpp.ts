@@ -71,7 +71,14 @@ export async function mppFetch(service: string, url: string, init: RequestInit =
     const res = await ctx.run(store, () =>
       client!.fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(cfg.UPSTREAM_TIMEOUT_MS) }),
     );
-    if (res.status === 402) throw errors.busy('upstream payment was not accepted');
+    if (res.status === 402) {
+      // The provider refused our payment (e.g. not enough USDC.e on Tempo): nothing was taken,
+      // so the user's request stays refundable.
+      const charge = chargeCtx.getStore();
+      if (charge) charge.upstreamPaid = false;
+      log.warn({ service }, 'ALERT upstream refused the MPP payment; check USDC.e on Tempo');
+      throw errors.busy('upstream payment was not accepted');
+    }
     return res;
   } catch (e) {
     if (e instanceof BudgetExceeded || (e as Error)?.cause instanceof BudgetExceeded) throw errors.budget();

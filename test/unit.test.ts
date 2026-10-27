@@ -13,8 +13,8 @@ import { createHash } from 'node:crypto';
 import { isTransparent, validPayoutAddress, withdrawalAmounts } from '../src/routes/money.js';
 import { marginOf } from '../src/services/fees.js';
 import { decide } from '../src/treasury/float.js';
-import { chatMicroUsd, chatUsd, requiredMicroUsd, withMarkup, zatsToMicroUsd } from '../src/services/prices.js';
-import { convertSignal, solvePow, decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
+import { CHAT_BYTES_PER_TOKEN, CHAT_IMAGE_TOKENS, CHAT_MESSAGE_TOKENS, chatMicroUsd, chatQuote, chatUsd, requiredMicroUsd, withMarkup, zatsToMicroUsd } from '../src/services/prices.js';
+import { chatCostMicro, convertSignal, solvePow, decryptNote, deriveKeys, depositSlot, encryptNote, estimateDeposit, formatCredits, formatUsd, NoteBook, noteFromKeys, nullifierOf, parseZec, requestSignal, USD, withdrawSignal, ZEC, zeros } from '../sdk/index';
 import { buildSpend } from '../sdk/spend';
 import { CIRCUIT, nodeProve } from './helpers/prove.js';
 
@@ -103,6 +103,41 @@ test('prices: USD + 4.5% markup, charged in micro-USD; attachments metered per s
     const bytes = mb === 0 ? 1000 : 64 * 1024 + mb * 1024 * 1024;
     assert.equal(chatMicroUsd(odd, bytes), requiredMicroUsd(0.0021) + mb * requiredMicroUsd(0.01));
   }
+});
+
+test('metered chat: server price = SDK price = gateway formula; the output cap is enforced', () => {
+  const m = { id: 'anthropic/claude-sonnet-5.5', name: 'Claude', host: 'mpp' as const, usd: 0, vision: true, detail: '', testnet: false,
+    in_usd_per_m: 2, out_usd_per_m: 10, min_usd: 0.012, default_output: 4096, max_output: 16_000 };
+  const sheet = {
+    markup_bps: cfg.PRICE_MARKUP_BPS, attachments: { micro_usd_per_mb: 10450 },
+    models: [{ id: m.id, micro_usd: 0, metered: { in_usd_per_m: 2, out_usd_per_m: 10, min_usd: 0.012, default_output: 4096, max_output: 16_000,
+      bytes_per_token: CHAT_BYTES_PER_TOKEN, image_tokens: CHAT_IMAGE_TOKENS, message_tokens: CHAT_MESSAGE_TOKENS } }],
+  };
+  const img = { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,' + 'A'.repeat(200_000) } };
+  const bodies = [
+    { messages: [{ role: 'user', content: 'hi' }] },
+    { messages: [{ role: 'user', content: 'hi' }], max_tokens: 64 },
+    { messages: [{ role: 'user', content: 'hi' }], max_tokens: 100_000 }, // above the cap
+    { messages: [{ role: 'system', content: 'be brief' }, { role: 'user', content: '你好，世界'.repeat(500) }] },
+    { messages: [{ role: 'user', content: [{ type: 'text' as const, text: 'what is this?' }, img] }] },
+    { messages: Array.from({ length: 40 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: 'word '.repeat(300) })) },
+  ];
+  for (const b of bodies) {
+    const raw = JSON.stringify(b);
+    const q = chatQuote(m, b as never, Buffer.byteLength(raw));
+    assert.equal(BigInt(q.micro), chatCostMicro(sheet, m.id, raw), raw.slice(0, 60));
+    assert.ok(q.maxTokens! <= 16_000);
+  }
+  // Images aren't billed by their bytes; a long output cap costs more; the floor applies.
+  const one = chatQuote(m, { messages: [{ content: 'hi' }] }, 64);
+  assert.equal(one.maxTokens, 4096);
+  assert.equal(one.micro, requiredMicroUsd(((Math.ceil(2 / 3) + 8) * 2 + 4096 * 10) / 1e6)); // 9 input tokens + 4096 output
+  assert.equal(chatQuote(m, { messages: [{ content: 'hi' }], max_tokens: 16 }, 64).micro, requiredMicroUsd(0.012));
+  assert.equal(chatQuote(m, { messages: [{ content: 'hi' }], max_tokens: 100_000 }, 64).maxTokens, 16_000);
+  // Always at least what the gateway charges for the same request (its estimate: ~4-5 bytes a token).
+  const long = 'word '.repeat(20_000);
+  const gateway = (long.length / 5) * 2 / 1e6 + 1024 * 10 / 1e6;
+  assert.ok(chatQuote(m, { messages: [{ content: long }], max_tokens: 1024 }, long.length).micro / 1e6 >= gateway);
 });
 
 test('withdrawal maths and address checks (transparent only when opted in)', () => {

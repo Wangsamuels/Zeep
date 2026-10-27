@@ -24,7 +24,7 @@ import { checkRedisNetwork } from '../src/lib/redis.js';
 import { checkDbNetwork } from '../src/migrate.js';
 import { reserveBooks } from '../src/services/reserve.js';
 import { housekeeping } from '../src/workers/treasury.js';
-import { deriveKeys, NoteBook, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
+import { chatCostMicro, deriveKeys, NoteBook, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
 import { nodeProve } from './helpers/prove.js';
 
 const BIN = new URL('../rust/target/debug/', import.meta.url).pathname;
@@ -164,6 +164,26 @@ test('pay for search and streamed AI in dollars with real proofs; the server nev
   assert.equal(alice.balance(USD), before.usd - searchCost - BigInt(model.micro_usd));
   const cols = await q<{ column_name: string }>(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public'`);
   assert.ok(!cols.some((c) => /balance/.test(c.column_name) && !/reserve/.test(c.column_name)));
+});
+
+test('metered frontier model: the app pays exactly the SDK price; a cheaper proof is refused', { timeout: 120_000 }, async () => {
+  (cfg.MODELS_JSON as unknown[]).push({ id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', host: 'mpp', usd: 0, vision: true, detail: '', testnet: true,
+    in_usd_per_m: 2, out_usd_per_m: 10, min_usd: 0.012, default_output: 4096, max_output: 16000 });
+  try {
+    const sheet = await alice.prices();
+    const listed = sheet.models.find((m: { id: string }) => m.id === 'anthropic/claude-sonnet-5.5');
+    assert.ok(listed.metered && listed.micro_usd > 40_000); // "from" price at the default 4096-token cap
+    const raw = JSON.stringify({ model: listed.id, max_tokens: 512, messages: [{ role: 'user', content: 'word '.repeat(2000) }] });
+    const cost = chatCostMicro(sheet, listed.id, raw);
+    const short = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost - 1n);
+    assert.equal(short.status, 402);
+    const before = alice.balance(USD);
+    const ok = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost);
+    assert.equal(ok.status, 200, await ok.clone().text());
+    assert.equal(alice.balance(USD), before - cost);
+  } finally {
+    (cfg.MODELS_JSON as { id: string }[]).splice((cfg.MODELS_JSON as { id: string }[]).findIndex((m) => m.id === 'anthropic/claude-sonnet-5.5'), 1);
+  }
 });
 
 test('replays are refused (409) and underpaying is refused (402) without losing money', { timeout: 120_000 }, async () => {

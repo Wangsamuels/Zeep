@@ -146,6 +146,47 @@ export function modelById(id: string): ModelInfo | undefined {
   return models().find((m) => m.id === id);
 }
 
+// ---------------------------------------------------------------- metered chat pricing
+// Mirrored exactly in sdk/client.ts (chatCostMicro); test/unit.test.ts checks they agree.
+/** Conservative token estimate for text: 1 token per 3 UTF-8 bytes (gateways count ~4–5). */
+export const CHAT_BYTES_PER_TOKEN = 3;
+/** Allowance per image (gateways don't count image bytes as text). */
+export const CHAT_IMAGE_TOKENS = 1_500;
+/** Per-message overhead (role, separators). */
+export const CHAT_MESSAGE_TOKENS = 8;
+
+type ChatMessage = { content: string | ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } })[] };
+
+export function chatInputTokens(messages: ChatMessage[]): number {
+  let bytes = 0;
+  let images = 0;
+  for (const m of messages) {
+    if (typeof m.content === 'string') bytes += Buffer.byteLength(m.content, 'utf8');
+    else for (const p of m.content) {
+      if (p.type === 'text') bytes += Buffer.byteLength(p.text, 'utf8');
+      else images++;
+    }
+  }
+  return Math.ceil(bytes / CHAT_BYTES_PER_TOKEN) + images * CHAT_IMAGE_TOKENS + messages.length * CHAT_MESSAGE_TOKENS;
+}
+
+/** True when the model is priced per request from its tokens (frontier models over MPP). */
+export const isMetered = (m: ModelInfo) => m.in_usd_per_m !== undefined && m.out_usd_per_m !== undefined;
+
+/** The output cap a request runs with: what the client asked for, never above the model's cap. */
+export const chatOutputCap = (m: ModelInfo, requested?: number) => Math.min(requested ?? m.default_output, m.max_output);
+
+/**
+ * What a chat request costs, in micro-USD (markup included), and the output cap to enforce.
+ * Metered: max(min, input tokens × in + output cap × out). Flat: the model price + extra MB.
+ */
+export function chatQuote(m: ModelInfo, body: { messages: ChatMessage[]; max_tokens?: number }, bodyBytes: number): { micro: number; maxTokens?: number } {
+  if (!isMetered(m)) return { micro: chatMicroUsd(m, bodyBytes), maxTokens: body.max_tokens };
+  const maxTokens = chatOutputCap(m, body.max_tokens);
+  const usd = Math.max(m.min_usd, (chatInputTokens(body.messages) * m.in_usd_per_m! + maxTokens * m.out_usd_per_m!) / 1e6);
+  return { micro: requiredMicroUsd(usd), maxTokens };
+}
+
 /** Per-response price for a chat body of `bodyBytes` (attachments beyond 64 KB are metered). */
 export function chatUsd(model: ModelInfo, bodyBytes: number): number {
   const extraMb = Math.max(0, Math.ceil((bodyBytes - 64 * 1024) / (1024 * 1024)));
@@ -174,9 +215,21 @@ export async function priceSheet() {
     zec_price_source: q.current.source,
     quoted_at: q.current.at,
     routes: Object.fromEntries(Object.entries(cfg.SERVICE_PRICES_USD_JSON).map(([k, usd]) => [k, { micro_usd: m(usd), credits: cr(usd) }])),
-    models: models().map((x) => ({
-      id: x.id, name: x.name, host: x.host, detail: x.detail, vision: x.vision, micro_usd: m(x.usd), credits: cr(x.usd),
-    })),
+    models: models().map((x) => {
+      // "From" price: a one-line message at the default output cap.
+      const from = chatQuote(x, { messages: [{ content: 'hi' }] }, 64).micro;
+      return {
+        id: x.id, name: x.name, host: x.host, detail: x.detail, vision: x.vision,
+        micro_usd: isMetered(x) ? from : m(x.usd),
+        credits: (isMetered(x) ? from : m(x.usd)) / cfg.MICRO_USD_PER_CREDIT,
+        // Metered models: the client computes the exact price with the same formula
+        // (sdk chatCostMicro). Absent for flat-priced models.
+        metered: isMetered(x)
+          ? { in_usd_per_m: x.in_usd_per_m, out_usd_per_m: x.out_usd_per_m, min_usd: x.min_usd, default_output: x.default_output, max_output: x.max_output,
+              bytes_per_token: CHAT_BYTES_PER_TOKEN, image_tokens: CHAT_IMAGE_TOKENS, message_tokens: CHAT_MESSAGE_TOKENS }
+          : null,
+      };
+    }),
     attachments: { free_kb: 64, micro_usd_per_mb: m(cfg.ATTACHMENT_USD_PER_MB), max_body_mb: cfg.CHAT_MAX_BODY_MB },
     default_model: cfg.DEFAULT_MODEL,
   };

@@ -732,3 +732,38 @@ const WATCH_MS = 30 * 86_400_000;
 const WATCH_EVERY_MS = 10 * 60_000;
 const utcDay = (): number => Math.floor(Date.now() / 86_400_000);
 const toZats = (micro: bigint, zecUsd: number): bigint => (micro <= 0n ? 0n : BigInt(Math.floor((Number(micro) / 1e6 / zecUsd) * 1e8)));
+
+/**
+ * Exact price of a chat request, in micro-USD: what POST /v1/ai/chat/completions charges for
+ * this `rawBody` (the exact string you send). Pass the result as the cost to pay().
+ * Metered (frontier) models: max(min, input tokens × in + output cap × out) + markup, where the
+ * output cap is body.max_tokens (or the model default), never above the model's max.
+ * Flat models: model price + attachment MB beyond 64 KB. Mirrors src/services/prices.ts.
+ */
+export function chatCostMicro(sheet: any, modelId: string, rawBody: string): bigint {
+  const m = sheet.models.find((x: { id: string }) => x.id === modelId);
+  if (!m) throw new ZeepApiError(`unknown model ${modelId}`, 400, "bad_request", null);
+  const bytes = utf8Len(rawBody);
+  if (!m.metered) {
+    const extraMb = Math.max(0, Math.ceil((bytes - 64 * 1024) / (1024 * 1024)));
+    return BigInt(m.micro_usd) + BigInt(extraMb) * BigInt(sheet.attachments.micro_usd_per_mb);
+  }
+  const r = m.metered;
+  const body = JSON.parse(rawBody) as { messages: { content: string | { type: string; text?: string }[] }[]; max_tokens?: number };
+  let text = 0;
+  let images = 0;
+  for (const msg of body.messages) {
+    if (typeof msg.content === "string") text += utf8Len(msg.content);
+    else for (const p of msg.content) {
+      if (p.type === "text") text += utf8Len(p.text ?? "");
+      else images++;
+    }
+  }
+  const input = Math.ceil(text / r.bytes_per_token) + images * r.image_tokens + body.messages.length * r.message_tokens;
+  const out = Math.min(body.max_tokens ?? r.default_output, r.max_output);
+  const usd = Math.max(r.min_usd, (input * r.in_usd_per_m + out * r.out_usd_per_m) / 1e6);
+  const marked = (usd * (10_000 + sheet.markup_bps)) / 10_000;
+  return BigInt(Math.ceil(Math.round(marked * 1e12) / 1e6));
+}
+
+const utf8Len = (s: string): number => new TextEncoder().encode(s).length;

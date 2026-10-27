@@ -35,37 +35,61 @@ npx wrangler delete --name zeep-relay-testnet
 - The `deploy` command prints `https://zeep-relay-mainnet.<you>.workers.dev`. That is your new API URL.
 - Deleting the testnet Worker is safe: it now points at a mainnet app.
 
-## 3. Your own keys (one command)
+## 3. Your own keys and settings
 
 The app **refuses to start on mainnet if any of these is missing**. That check is deliberate, so a missing key is caught before a user pays.
+
+**Already set:** `TEMPO_PRIVATE_KEY`, `RELAY_API_KEY` and `NEAR_ONECLICK_JWT`.
+
+**a) Relay URL, frontend, RPCs and a funding limit that suits a small float:**
 
 ```bash
 heroku config:set -a zeep-test \
   PUBLIC_API_BASE_URL="https://zeep-relay-mainnet.<you>.workers.dev" \
   CORS_ALLOWED_ORIGINS="https://zeep-frontend.vercel.app" \
-  TEMPO_PRIVATE_KEY="0x..." \
-  TEMPO_RPC_URL="https://..." \
-  BASE_RPC_URL="https://..." \
-  RELAY_API_KEY="..." \
-  MODAL_LLM_BASE_URL="https://..." \
-  MODAL_PROXY_TOKEN="..."
+  TEMPO_RPC_URL="https://rpc.tempo.xyz" \
+  BASE_RPC_URL="https://base.drpc.org" \
+  MPP_SESSION_MAX_USD=1 \
+  MPP_DAILY_BUDGET_USD=5
 ```
 
-| Var | What it is |
+| Var | Value |
 | --- | --- |
-| `PUBLIC_API_BASE_URL` | The mainnet Worker URL from step 2. |
-| `CORS_ALLOWED_ORIGINS` | Your Vercel URL. |
-| `TEMPO_PRIVATE_KEY` | The treasury's EVM key. Fund it with a little gas on Base and Tempo, and about $50 of USDC.e on Tempo. It pays for AI, search and email, and moves the dollar float. |
-| `TEMPO_RPC_URL`, `BASE_RPC_URL` | RPC endpoints for Tempo and Base. `BASE_RPC_URL` defaults to the public `https://mainnet.base.org`. |
-| `RELAY_API_KEY` | Relay.link API key, from the Relay dashboard → Apps. |
-| `MODAL_LLM_BASE_URL`, `MODAL_PROXY_TOKEN` | Your Modal deployment for the open-weight models. **No Modal yet?** See the option below the table. |
-| `NEAR_ONECLICK_JWT` | **Already set** on testnet, so keep it. It's checked again on mainnet. |
+| `TEMPO_RPC_URL` | Tempo's official RPC (chain 4217). |
+| `BASE_RPC_URL` | a public Base RPC that doesn't log, from chainlist (chain 8453). |
+| `MPP_SESSION_MAX_USD=1` | The most Zeep locks into one payment session with a provider. Keep it at or below the USDC.e on Tempo. Raise it once the float grows. |
+| `MPP_DAILY_BUDGET_USD=5` | The most Zeep spends on paid services per day, for all users together. Users pay it back, but it also caps how much the service can be used in a day. |
 
-**No Modal yet?** Offer only the frontier models (GPT-5, Claude, Gemini, paid over MPP) by replacing the model list:
+Raise both as deposits grow the float. A long GPT-6 Astra chat can cost more than $1 for one request, so it needs `MPP_SESSION_MAX_USD` and the float above that.
+
+**b) AI models: 10 frontier models (6 American, 4 Chinese), all through the MPP OpenRouter gateway (no Modal needed):**
 
 ```bash
-heroku config:set -a zeep-test DEFAULT_MODEL="anthropic/claude-sonnet-4.5" MODELS_JSON='[{"id":"openai/gpt-5","name":"GPT-5","host":"mpp","usd":0.04,"vision":true,"detail":"Frontier, via MPP","testnet":false},{"id":"anthropic/claude-sonnet-4.5","name":"Claude Sonnet 4.5","host":"mpp","usd":0.03,"vision":true,"detail":"Frontier, via MPP","testnet":false},{"id":"google/gemini-2.5-pro","name":"Gemini 2.5 Pro","host":"mpp","usd":0.03,"vision":true,"detail":"Frontier, via MPP","testnet":false}]'
+heroku config:set -a zeep-test DEFAULT_MODEL="anthropic/claude-sonnet-5.5" MODELS_JSON='[{"id":"anthropic/claude-sonnet-5.5","name":"Claude Sonnet 5.5","host":"mpp","usd":0,"vision":true,"detail":"Anthropic · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":10},{"id":"openai/gpt-6.1-sol","name":"GPT-6.1 Sol","host":"mpp","usd":0,"vision":true,"detail":"OpenAI · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":10},{"id":"anthropic/claude-opus-5.5","name":"Claude Opus 5.5","host":"mpp","usd":0,"vision":true,"detail":"Anthropic · frontier, top tier","testnet":false,"gateway":"openrouter","in_usd_per_m":4,"out_usd_per_m":20},{"id":"openai/gpt-6-astra","name":"GPT-6 Astra","host":"mpp","usd":0,"vision":true,"detail":"OpenAI · frontier, top tier","testnet":false,"gateway":"openrouter","in_usd_per_m":10,"out_usd_per_m":50},{"id":"google/gemini-4-argon","name":"Gemini 4 Argon","host":"mpp","usd":0,"vision":true,"detail":"Google · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":10},{"id":"x-ai/grok-4.7","name":"Grok 4.7","host":"mpp","usd":0,"vision":true,"detail":"xAI · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":6},{"id":"deepseek/deepseek-v4-pro-0813","name":"DeepSeek V4 Pro","host":"mpp","usd":0,"vision":false,"detail":"DeepSeek · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":1.32,"out_usd_per_m":3.96},{"id":"qwen/qwen3.8-max-0902","name":"Qwen 3.8 Max","host":"mpp","usd":0,"vision":true,"detail":"Alibaba · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":6},{"id":"moonshotai/kimi-k3.1-pro","name":"Kimi K3.1 Pro","host":"mpp","usd":0,"vision":true,"detail":"Moonshot · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2,"out_usd_per_m":10},{"id":"z-ai/glm-5.3-prime","name":"GLM 5.3 Prime","host":"mpp","usd":0,"vision":false,"detail":"Zhipu · frontier","testnet":false,"gateway":"openrouter","in_usd_per_m":2.8,"out_usd_per_m":8.8}]'
 ```
+
+The gateway charges Zeep per request, upfront: input tokens × input rate plus the output cap × output rate, with a $0.012 minimum. Zeep charges the user with the same formula plus 4.5%, before the request runs. It also enforces the output cap, so no reply can cost Zeep more than the user paid.
+
+With the default 4,096-token cap, a short question costs about:
+
+| Model | Price per reply |
+| --- | --- |
+| GPT-6 Astra | $0.214 |
+| Claude Opus 5.5 | $0.086 |
+| Claude Sonnet 5.5, GPT-6.1 Sol, Gemini 4 Argon, Kimi K3.1 Pro | $0.043 |
+| GLM 5.3 Prime | $0.038 |
+| Grok 4.7, Qwen 3.8 Max | $0.026 |
+| DeepSeek V4 Pro | $0.017 |
+
+**c) How much USDC.e the treasury needs.** You don't need $50; $1 works.
+
+**Users always pay for every reply from their own balance, from the first one.** The USDC.e on Tempo is only Zeep's working float. Zeep pays the AI provider from it the moment a request runs, and gets that back from the user's payment, which is converted to USDC.e along with the dollar half of every deposit, about 20–60 minutes after it confirms. So the float refills itself.
+
+A small float can only run short for a moment:
+
+- **Paid services (AI, search, inbox):** if the float is momentarily empty, the request returns "busy" and the user's payment comes straight back to them as a new note. Nobody is charged for a reply they didn't get.
+- **Withdrawals that convert credits back to ZEC** wait (with an ALERT in the logs) until the float covers them. ZEC-only withdrawals always work.
+- **Base gas:** about 0.0002 ETH covers many bridge transactions. Top it up if the logs show `insufficient funds`.
 
 ## 4. A new reserve wallet (mainnet)
 
