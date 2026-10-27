@@ -50,7 +50,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     .then(() => pool.end())
     .then(() => process.exit(0))
     .catch((e) => {
-      log.error({ err: e }, 'migration failed');
-      process.exit(1);
+      // Plain text, flushed before exit (an async logger would lose it on process.exit).
+      process.stderr.write(`migration failed: ${e instanceof Error ? e.message : String(e)}\n`, () => process.exit(1));
     });
 }

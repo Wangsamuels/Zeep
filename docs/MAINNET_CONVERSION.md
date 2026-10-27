@@ -91,10 +91,18 @@ A small float can only run short for a moment:
 - **Withdrawals that convert credits back to ZEC** wait (with an ALERT in the logs) until the float covers them. ZEC-only withdrawals always work.
 - **Base gas:** about 0.0002 ETH covers many bridge transactions. Top it up if the logs show `insufficient funds`.
 
+### Check your config at any time
+
+```bash
+heroku run -a zeep-test -- node dist/doctor.js
+```
+
+This prints every missing or wrong setting in plain text, never the values. The release step only needs the database and network settings, so you can set variables in any order. Until everything is set, the web and treasury dynos refuse to start; `doctor.js`, and each release's output, list what's still missing.
+
 ## 4. A new reserve wallet (mainnet)
 
 ```bash
-heroku run -a zeep-test --type=wallet -- /app/bin/zeep-wallet init
+heroku run -a zeep-test --type=wallet -e "ZCASH_NETWORK=main;LIGHTWALLETD_URL=https://zec.rocks:443" -- /app/bin/zeep-wallet init
 ```
 
 It prints four lines once. **Write the 24 words down offline**: they control real money. Then set the four values it printed:

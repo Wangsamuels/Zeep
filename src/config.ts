@@ -285,6 +285,11 @@ function load(): Config {
     throw new Error(`Invalid configuration: ${msg}`);
   }
   let problems = networkProblems(parsed.data);
+  // Release phase / doctor: only what migrations need (database + network identity). Wrong-network
+  // addresses still stop it; missing service keys are reported by release.ts instead of failing it.
+  if (process.env.ZEEP_PHASE === 'release') {
+    problems = problems.filter((m) => /ZCASH_NETWORK|ZEEP_RECEIVE_UA|ZEEP_RESERVE_TADDR|TREASURY_REFUND_TO/.test(m));
+  }
   // End-to-end tests run mainnet settings against the simulated chain and mock rails. Never
   // possible on Heroku (DYNO is set there) or outside NODE_ENV=test.
   if (process.env.ZEEP_TEST_SIMULATION === '1') {

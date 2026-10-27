@@ -13,7 +13,7 @@ build:
 release:
   image: web
   command:
-    - node dist/migrate.js
+    - node dist/release.js
 run:
   web: node dist/server.js
   treasury: node dist/workers/treasury.js
