@@ -10,8 +10,10 @@ enabled = false
 
 [env.testnet]
 name = "zeep-relay-testnet"
-vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com" }
+vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com", LWD_ORIGIN = "https://zcash-testnet.chainsafe.dev" }
 
 [env.mainnet]
 name = "zeep-relay-mainnet"
-vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com" }  # same Heroku app, converted to mainnet
+# Same Heroku app, converted to mainnet. LWD_ORIGIN: the in-app wallet's light-wallet server,
+# reached through this relay at /lwd so it never sees the user's IP.
+vars = { ORIGIN = "https://zeep-test-448a62f2c434.herokuapp.com", LWD_ORIGIN = "https://zcash-mainnet.chainsafe.dev" }

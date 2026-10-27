@@ -139,9 +139,11 @@ Vercel → Settings → Environment Variables:
 | --- | --- |
 | `NEXT_PUBLIC_ZEEP_NETWORK` | `mainnet` |
 | `NEXT_PUBLIC_API_BASE_URL_MAINNET` | the mainnet Worker URL, with no trailing slash |
-| `NEXT_PUBLIC_LIGHTWALLETD_URL_MAINNET` | `https://zec.rocks:443` |
+| `NEXT_PUBLIC_LIGHTWALLETD_URL_MAINNET` | the mainnet Worker URL followed by `/lwd`, e.g. `https://zeep-relay-mainnet.<you>.workers.dev/lwd` |
 
 Then **Redeploy**.
+
+The in-app wallet reaches its light-wallet server through the relay's `/lwd` path. Browsers can't speak raw gRPC, so `zec.rocks` doesn't work from the app directly. Going through the relay also means the light-wallet server never sees a user's IP next to their transparent address or the transactions they send.
 
 ## 8. Tell Claude: dry run
 

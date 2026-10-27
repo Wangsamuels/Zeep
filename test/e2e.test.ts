@@ -15,6 +15,7 @@ import { generateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 import { cfg } from '../src/config.js';
 import { pool, q } from '../src/lib/db.js';
+import { log } from '../src/lib/log.js';
 import { redis } from '../src/lib/redis.js';
 import { migrate } from '../src/migrate.js';
 import { registry } from '../src/notes/registry.js';
@@ -596,4 +597,187 @@ test('encrypted vault: chat items with 30-day auto-delete, auth required', async
   await q(`UPDATE vault_items SET expires_at = now() - interval '1 second'`);
   assert.equal((await fetch(url, { headers: h })).status, 404);
   assert.equal((await fetch(`${base}/v1/vault`, { method: 'DELETE', headers: h })).status, 204);
+});
+
+// ------------------------------------------------------------------ adversarial: money-loss channels
+// Each test tries to get something for nothing and checks the books to the micro-dollar.
+const svcBooks = async () => {
+  const [r] = await q<{ s: string; c: string }>(`SELECT COALESCE(SUM(amount),0) AS s, COALESCE(SUM(count),0) AS c FROM books_daily WHERE kind = 'service'`);
+  const [k] = await q<{ s: string; c: string }>(`SELECT COALESCE(SUM(amount),0) AS s, COALESCE(SUM(count),0) AS c FROM books_daily WHERE kind = 'compensation'`);
+  return { service: BigInt(r.s), serviceN: Number(r.c), comp: BigInt(k.s), compN: Number(k.c) };
+};
+/** A fetch that records every request, so a test can replay the exact bytes (proof headers included). */
+function recorder() {
+  const sent: { url: string; init: RequestInit }[] = [];
+  const f = ((url: string, init: RequestInit = {}) => { sent.push({ url, init }); return fetch(url, init); }) as typeof fetch;
+  return { sent, f };
+}
+/** A fetch that withholds the paid request (keeping its exact bytes) and passes everything else through. */
+const holdProof = (keep: (c: { url: string; init: RequestInit }) => void) => (async (url: string, init: RequestInit = {}) => {
+  if (!(init.headers as Record<string, string> | undefined)?.['x-zeep-proof']) return fetch(url, init);
+  keep({ url, init });
+  return new Response('{"error":{"code":"held","message":"held by the test"}}', { status: 599 });
+}) as typeof fetch;
+const mPhrase = generateMnemonic(wordlist, 256);
+const mKeys = deriveKeys(seedFromPhrase(mPhrase), NET);
+const rec = recorder();
+const mallory = new ZeepClient({ baseUrl: '', keys: mKeys, book: new NoteBook(), prove: nodeProve, fetch: rec.f });
+
+test('adversarial setup: mallory deposits 0.2 ZEC', { timeout: 120_000 }, async () => {
+  (mallory as unknown as { base: string }).base = base;
+  const d = await mallory.startDeposit(20_000_000n, undefined, false);
+  await payInto(d.address, 20_000_000);
+  await until(async () => !!(await mallory.depositStatus(d.slot)).credited);
+  assert.ok(mallory.balance(USD) > 4_000_000n);
+});
+
+test('adversarial: the same paid request sent twice at once is charged once and served once', { timeout: 120_000 }, async () => {
+  const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
+  const before = await svcBooks();
+  const r1 = await mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'race' }), cost);
+  assert.equal(r1.status, 200);
+  const last = rec.sent[rec.sent.length - 1];
+  // Replay the identical bytes twice in parallel (a malicious client or a retrying proxy).
+  const [a, b] = await Promise.all([fetch(last.url, last.init), fetch(last.url, last.init)]);
+  assert.deepEqual([a.status, b.status], [409, 409]);
+  const after = await svcBooks();
+  assert.equal(after.service - before.service, cost); // one charge
+  assert.equal(after.serviceN - before.serviceN, 1);
+});
+
+test('adversarial: two simultaneous first uses of one proof → exactly one succeeds', { timeout: 120_000 }, async () => {
+  const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
+  const before = await svcBooks();
+  // Capture a fresh proof without sending it, then fire it twice concurrently.
+  let captured: { url: string; init: RequestInit } | undefined;
+  const hold = new ZeepClient({ baseUrl: base, keys: mKeys, book: mallory.book, prove: nodeProve,
+    fetch: holdProof((c) => (captured = c)) });
+  await hold.pay('POST', '/v1/search', JSON.stringify({ query: 'twin' }), cost).catch(() => {});
+  assert.ok(captured);
+  const rs = await Promise.all([fetch(captured!.url, captured!.init), fetch(captured!.url, captured!.init)]);
+  assert.deepEqual(rs.map((r) => r.status).sort(), [200, 409]);
+  const after = await svcBooks();
+  assert.equal(after.service - before.service, cost);
+  await mallory.restore();
+});
+
+test('adversarial: a proof is bound to its route and body (no reuse elsewhere, no free upgrade)', { timeout: 120_000 }, async () => {
+  const p = await mallory.prices();
+  const cost = BigInt(p.routes.search.micro_usd);
+  const before = await svcBooks();
+  let captured: { url: string; init: RequestInit } | undefined;
+  const hold = new ZeepClient({ baseUrl: base, keys: mKeys, book: mallory.book, prove: nodeProve,
+    fetch: holdProof((c) => (captured = c)) });
+  await hold.pay('POST', '/v1/search', JSON.stringify({ query: 'cheap' }), cost).catch(() => {});
+  const h = captured!.init.headers as Record<string, string>;
+  // Same proof, different body (a longer query) and different routes (research, an AI reply).
+  const other = await fetch(`${base}/v1/search`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'something else entirely' }) });
+  const research = await fetch(`${base}/v1/research`, { method: 'POST', headers: h, body: JSON.stringify({ query: 'cheap', processor: 'pro' }) });
+  const chat = await fetch(`${base}/v1/ai/chat/completions`, { method: 'POST', headers: h, body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }) });
+  for (const r of [other, research, chat]) assert.ok([401, 402, 422].includes(r.status), `status ${r.status}`); // refused before any note is burnt
+  assert.equal((await svcBooks()).service, before.service); // nothing charged
+  // The untouched proof still works exactly once for its own request.
+  const ok = await fetch(captured!.url, captured!.init);
+  assert.equal(ok.status, 200);
+  // The app never saw that reply, so it lost track of its change; the 24 words get it back.
+  await mallory.restore();
+  assert.ok(mallory.balance(USD) > 0n, 'change from a hand-sent proof is recoverable');
+});
+
+test('adversarial: underpaying and wildly overpaying are refused without losing the notes', { timeout: 120_000 }, async () => {
+  const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
+  const usd0 = mallory.balance(USD);
+  const under = await mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'under' }), cost - 1n);
+  assert.equal(under.status, 402);
+  const over = await mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'over' }), cost * 5n);
+  assert.ok(over.status >= 400);
+  assert.equal(mallory.balance(USD), usd0);
+});
+
+test('adversarial: a failed upstream refunds exactly once; replaying the failed proof gets nothing', { timeout: 120_000 }, async () => {
+  const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
+  const c = cfg as { MPP_DAILY_BUDGET_USD: number };
+  const saved = c.MPP_DAILY_BUDGET_USD;
+  const usd0 = mallory.balance(USD);
+  const before = await svcBooks();
+  c.MPP_DAILY_BUDGET_USD = 0; // the provider can't be paid → request fails before Zeep pays
+  let failed: Response;
+  try {
+    failed = await mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'refund me' }), cost);
+  } finally {
+    c.MPP_DAILY_BUDGET_USD = saved;
+  }
+  assert.equal(failed!.status, 503);
+  assert.equal(mallory.balance(USD), usd0); // refunded as a new note
+  const last = rec.sent[rec.sent.length - 1];
+  const replay = await fetch(last.url, last.init); // budget is back: try to get it served for free
+  assert.equal(replay.status, 409);
+  const after = await svcBooks();
+  assert.equal(after.compN - before.compN, 1);
+  assert.equal(after.service - before.service, cost); // charged once…
+  assert.equal(after.comp - before.comp, cost); // …and returned once
+});
+
+test('adversarial: two devices spend the same notes at once (service + withdrawal) → only one goes through', { timeout: 180_000 }, async () => {
+  await mallory.refreshSpent();
+  // Device B: a copy of mallory's book (same 24 words on a second device).
+  const bookB = NoteBook.from(JSON.parse(JSON.stringify(mallory.book.toJSON())));
+  const deviceB = new ZeepClient({ baseUrl: base, keys: mKeys, book: bookB, prove: nodeProve });
+  const usd = mallory.balance(USD);
+  const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
+  const plan = await deviceB.planWithdrawal('all');
+  const [pay, wd] = await Promise.allSettled([
+    mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'device A' }), cost),
+    deviceB.withdraw(plan, SAPLING),
+  ]);
+  const paid = pay.status === 'fulfilled' && pay.value.status === 200;
+  const withdrew = wd.status === 'fulfilled' && !!wd.value?.withdrawal_id;
+  assert.ok(paid !== withdrew || !paid, `both went through: pay=${paid} withdraw=${withdrew}`);
+  // Whatever happened, the server never owes more than was deposited.
+  await mallory.refreshSpent();
+  await deviceB.refreshSpent();
+  const b = await reserveBooks();
+  assert.ok(b.usd.coverage_bps >= 10_000, JSON.stringify(b.usd));
+  assert.ok(usd >= 0n);
+  await sleep(1500);
+  await settleFloat();
+});
+
+test('adversarial: the books balance after every attack (owed = all users\' notes; held ≥ owed)', { timeout: 120_000 }, async () => {
+  await sleep(1500);
+  await alice.refreshSpent();
+  await mallory.refreshSpent();
+  const b = await reserveBooks();
+  assert.ok(b.usd.coverage_bps >= 10_000, JSON.stringify(b.usd));
+  assert.ok(b.zec.coverage_bps >= 10_000, JSON.stringify(b.zec));
+  assert.ok(b.profit.net_micro_usd > 0, JSON.stringify(b.profit));
+  const [n] = await q<{ n: number }>('SELECT count(*)::int AS n FROM (SELECT nullifier FROM nullifiers GROUP BY nullifier HAVING count(*) > 1) x');
+  assert.equal(n.n, 0); // no note ever spent twice
+});
+
+test('privacy: no IP, user agent or client header reaches a handler, a log or the database', { timeout: 60_000 }, async () => {
+  const cols = await q<{ column_name: string }>(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public'`);
+  assert.ok(!cols.some((c) => /(^|_)ip($|_)|user_agent|useragent|remote_addr|forwarded/i.test(c.column_name)), cols.map((c) => c.column_name).join(','));
+  // Capture everything the app hands its logger (every level) while a request carries
+  // every identifying header there is.
+  const lines: string[] = [];
+  const L = log as unknown as Record<string, unknown> & { level: string };
+  const savedLevel = L.level;
+  L.level = 'trace';
+  const levels = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'];
+  const origs = Object.fromEntries(levels.map((k) => [k, L[k]]));
+  for (const k of levels) L[k] = (...a: unknown[]) => { lines.push(JSON.stringify(a)); };
+  try {
+    await fetch(`${base}/v1/status`, { headers: {
+      'x-forwarded-for': '198.51.100.23', 'x-real-ip': '198.51.100.24', 'cf-connecting-ip': '198.51.100.25', forwarded: 'for=198.51.100.26',
+      'true-client-ip': '198.51.100.27', 'user-agent': 'SecretBrowser/9.9 (alice-laptop)', 'accept-language': 'xx-SECRET',
+    } });
+    await sleep(300);
+  } finally {
+    Object.assign(L, origs);
+    L.level = savedLevel;
+  }
+  const logged = lines.join('');
+  assert.ok(logged.includes('"route":"/v1/status"'), 'the request was logged (route/status/latency only)');
+  for (const s of ['198.51.100', 'SecretBrowser', 'alice-laptop', 'xx-SECRET']) assert.ok(!logged.includes(s), `log leaked ${s}`);
 });
