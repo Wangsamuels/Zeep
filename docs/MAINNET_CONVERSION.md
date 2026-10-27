@@ -10,7 +10,7 @@ Testnet data is erased, by design. A database or Redis that has held testnet dat
 
 ```bash
 cd ~/Zeep/zeep-backend
-./deploy/convert-to-mainnet.sh zeep-test
+bash ./deploy/convert-to-mainnet.sh zeep-test
 ```
 
 It asks you to type the app name, then:
