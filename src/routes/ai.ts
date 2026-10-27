@@ -6,10 +6,10 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { cfg } from '../config.js';
-import { errors } from '../lib/errors.js';
+import { errors, ZeepError } from '../lib/errors.js';
 import { modalFetch } from '../services/modal.js';
 import { mppFetch } from '../services/mpp.js';
-import { chatQuote, modelById, priceSheet } from '../services/prices.js';
+import { chatQuote, IMAGE_PLACEHOLDER, isMetered, modelById, priceSheet } from '../services/prices.js';
 import { chargeRequest, pipeSse, upstreamJson, withCharge } from './paid.js';
 
 // Text, or OpenAI content parts: text and images (data: URLs, so nothing is fetched by URL).
@@ -45,10 +45,24 @@ export default async function aiRoutes(app: FastifyInstance) {
     const body = parsed.data;
     const model = modelById(body.model ?? cfg.DEFAULT_MODEL);
     if (!model) throw errors.bad(`unknown or disabled model: ${body.model}`);
-    const hasImage = body.messages.some((m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url'));
-    if (hasImage && !model.vision) throw errors.bad(`${model.name} can't read images; pick a model marked "reads images"`);
-
+    // Switching models mid-chat keeps the whole conversation. A model that can't read images
+    // only refuses an image in the NEW message; earlier images become a short placeholder.
+    const last = body.messages[body.messages.length - 1];
+    const lastHasImage = Array.isArray(last.content) && last.content.some((p) => p.type === 'image_url');
+    if (lastHasImage && !model.vision) throw errors.bad(`${model.name} can't read images; pick a model marked "reads images"`);
+    // Priced on the messages as sent (the SDK computes the same price from the same raw body).
     const quote = chatQuote(model, body, req.rawBody?.length ?? 0);
+    if (!model.vision) {
+      body.messages = body.messages.map((m) => (Array.isArray(m.content)
+        ? { ...m, content: m.content.map((p) => (p.type === 'image_url' ? { type: 'text' as const, text: IMAGE_PLACEHOLDER } : p)) }
+        : m));
+    }
+
+    // Refuse BEFORE payment when the chat no longer fits this model (the app trims old messages).
+    if (isMetered(model) && quote.inputTokens + (quote.maxTokens ?? 0) > model.context) {
+      throw new ZeepError(400, 'context_too_long', `This chat is too long for ${model.name}; start a new chat or drop older messages`,
+        { max_input_tokens: model.context - (quote.maxTokens ?? 0), estimated_input_tokens: quote.inputTokens });
+    }
     const s = await chargeRequest(req, reply, { micro: quote.micro });
     return withCharge(s, reply, async () => {
       const gateway = model.gateway ?? (model.id.startsWith('openai/') ? 'openai' : 'openrouter');

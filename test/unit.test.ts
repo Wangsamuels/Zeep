@@ -128,6 +128,12 @@ test('metered chat: server price = SDK price = gateway formula; the output cap i
     assert.equal(BigInt(q.micro), chatCostMicro(sheet, m.id, raw), raw.slice(0, 60));
     assert.ok(q.maxTokens! <= 16_000);
   }
+  // A text-only model: earlier images are priced as the short placeholder, same on both sides.
+  const textOnly = { ...m, id: 'deepseek/x', vision: false };
+  const sheet2 = { ...sheet, models: [{ ...sheet.models[0], id: textOnly.id, metered: { ...sheet.models[0].metered, image_tokens: 16 } }] };
+  const withImg = { messages: [{ role: 'user', content: [{ type: 'text' as const, text: 'look' }, img] }, { role: 'user', content: 'and now?' }] };
+  const rawImg = JSON.stringify(withImg);
+  assert.equal(BigInt(chatQuote(textOnly, withImg as never, rawImg.length).micro), chatCostMicro(sheet2, textOnly.id, rawImg));
   // Images aren't billed by their bytes; a long output cap costs more; the floor applies.
   const one = chatQuote(m, { messages: [{ content: 'hi' }] }, 64);
   assert.equal(one.maxTokens, 4096);

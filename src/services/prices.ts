@@ -154,10 +154,13 @@ export const CHAT_BYTES_PER_TOKEN = 3;
 export const CHAT_IMAGE_TOKENS = 1_500;
 /** Per-message overhead (role, separators). */
 export const CHAT_MESSAGE_TOKENS = 8;
+/** A model that can't read images gets this text instead of each earlier image (chat context kept). */
+export const IMAGE_PLACEHOLDER = '[image omitted: this model cannot see images]';
+export const CHAT_PLACEHOLDER_TOKENS = 16;
 
 type ChatMessage = { content: string | ({ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } })[] };
 
-export function chatInputTokens(messages: ChatMessage[]): number {
+export function chatInputTokens(messages: ChatMessage[], vision = true): number {
   let bytes = 0;
   let images = 0;
   for (const m of messages) {
@@ -167,7 +170,7 @@ export function chatInputTokens(messages: ChatMessage[]): number {
       else images++;
     }
   }
-  return Math.ceil(bytes / CHAT_BYTES_PER_TOKEN) + images * CHAT_IMAGE_TOKENS + messages.length * CHAT_MESSAGE_TOKENS;
+  return Math.ceil(bytes / CHAT_BYTES_PER_TOKEN) + images * (vision ? CHAT_IMAGE_TOKENS : CHAT_PLACEHOLDER_TOKENS) + messages.length * CHAT_MESSAGE_TOKENS;
 }
 
 /** True when the model is priced per request from its tokens (frontier models over MPP). */
@@ -180,11 +183,12 @@ export const chatOutputCap = (m: ModelInfo, requested?: number) => Math.min(requ
  * What a chat request costs, in micro-USD (markup included), and the output cap to enforce.
  * Metered: max(min, input tokens × in + output cap × out). Flat: the model price + extra MB.
  */
-export function chatQuote(m: ModelInfo, body: { messages: ChatMessage[]; max_tokens?: number }, bodyBytes: number): { micro: number; maxTokens?: number } {
-  if (!isMetered(m)) return { micro: chatMicroUsd(m, bodyBytes), maxTokens: body.max_tokens };
+export function chatQuote(m: ModelInfo, body: { messages: ChatMessage[]; max_tokens?: number }, bodyBytes: number): { micro: number; maxTokens?: number; inputTokens: number } {
+  const inputTokens = chatInputTokens(body.messages, m.vision);
+  if (!isMetered(m)) return { micro: chatMicroUsd(m, bodyBytes), maxTokens: body.max_tokens, inputTokens };
   const maxTokens = chatOutputCap(m, body.max_tokens);
-  const usd = Math.max(m.min_usd, (chatInputTokens(body.messages) * m.in_usd_per_m! + maxTokens * m.out_usd_per_m!) / 1e6);
-  return { micro: requiredMicroUsd(usd), maxTokens };
+  const usd = Math.max(m.min_usd, (inputTokens * m.in_usd_per_m! + maxTokens * m.out_usd_per_m!) / 1e6);
+  return { micro: requiredMicroUsd(usd), maxTokens, inputTokens };
 }
 
 /** Per-response price for a chat body of `bodyBytes` (attachments beyond 64 KB are metered). */
@@ -226,7 +230,8 @@ export async function priceSheet() {
         // (sdk chatCostMicro). Absent for flat-priced models.
         metered: isMetered(x)
           ? { in_usd_per_m: x.in_usd_per_m, out_usd_per_m: x.out_usd_per_m, min_usd: x.min_usd, default_output: x.default_output, max_output: x.max_output,
-              bytes_per_token: CHAT_BYTES_PER_TOKEN, image_tokens: CHAT_IMAGE_TOKENS, message_tokens: CHAT_MESSAGE_TOKENS }
+              context: x.context, bytes_per_token: CHAT_BYTES_PER_TOKEN, message_tokens: CHAT_MESSAGE_TOKENS,
+              image_tokens: x.vision ? CHAT_IMAGE_TOKENS : CHAT_PLACEHOLDER_TOKENS }
           : null,
       };
     }),

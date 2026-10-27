@@ -61,9 +61,19 @@ await client.setDailyLimit(20_000_000n); // $20 a day;  0n = no limit
 - Only payments that went through count: a refunded or refused request doesn't.
 - The limit applies per device. When the user signs in with their 24 words on a new device, it starts at $5 again unless the app restores it from the encrypted vault settings. Store it there with the other settings if you sync settings.
 
+## 6. Switching models mid-chat
+
+The app already keeps the conversation when the user picks another model. `send()` sends the chat's full history to whichever model is selected, and each reply keeps its model label. Keep it that way: never clear or restart the chat on a model change.
+
+The server now handles the two cases that used to break a switch:
+
+- **Earlier images, text-only model** (DeepSeek V4 Pro, GLM 5.3 Prime): the request goes through. The server replaces each earlier image with a short note telling the model an image was there. Only an image in the **new** message is refused. Your existing auto-switch to a vision model when attaching an image is still right.
+- **Chat longer than the new model's context:** refused with `400 context_too_long` **before** any payment. The response includes `max_input_tokens`. Drop the oldest messages (keep any system message), or suggest "Start a new chat", and send again. Every current model allows 500k–1M tokens, so this is rare.
+
 ## Check
 
 1. `npm run build` passes.
 2. On mainnet, a short and a long chat both get a reply.
 3. The price shows only in the model options, not while chatting, and the wallet history shows each reply's exact charge.
 4. With the daily limit set to $0.05, the second Sonnet reply is refused on the device and nothing is charged.
+5. A chat that started on Claude with a photo, then switched to DeepSeek, gets an answer that uses the earlier messages.

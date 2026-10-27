@@ -91,6 +91,8 @@ const Env = z.object({
         min_usd: z.number().nonnegative().default(0.012),
         default_output: z.number().int().positive().default(4096),
         max_output: z.number().int().positive().default(16_000),
+        /** Context window in tokens (input + output): longer chats are refused before payment. */
+        context: z.number().int().positive().default(128_000),
         gateway: z.enum(['openrouter', 'openai']).optional(),
       }),
     ),

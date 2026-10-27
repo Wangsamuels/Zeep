@@ -205,6 +205,45 @@ test("the user's own daily limit: default $5, adjustable, counted only for payme
   await alice.setDailyLimit(5_000_000n);
 });
 
+test('switching models mid-chat keeps the context: earlier images become a note for text-only models; too-long chats refused before payment', { timeout: 120_000 }, async () => {
+  const add = [
+    { id: 'deepseek/deepseek-v4-pro-0813', name: 'DeepSeek V4 Pro', host: 'mpp', usd: 0, vision: false, detail: '', testnet: true, in_usd_per_m: 1.32, out_usd_per_m: 3.96, min_usd: 0.012, default_output: 4096, max_output: 16000, context: 1_000_000 },
+    { id: 'test/tiny-context', name: 'Tiny', host: 'mpp', usd: 0, vision: true, detail: '', testnet: true, in_usd_per_m: 1, out_usd_per_m: 1, min_usd: 0.012, default_output: 1024, max_output: 2048, context: 5000 },
+  ];
+  (cfg.MODELS_JSON as unknown[]).push(...add);
+  try {
+    const sheet = await alice.prices();
+    const img = { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } };
+    // The chat started on a vision model with a photo; the user now switches to DeepSeek (text only).
+    const history = [
+      { role: 'user', content: [{ type: 'text', text: 'what is in this photo?' }, img] },
+      { role: 'assistant', content: 'A cat on a sofa.' },
+      { role: 'user', content: 'what colour was the sofa?' },
+    ];
+    const raw = JSON.stringify({ model: 'deepseek/deepseek-v4-pro-0813', messages: history });
+    const before = alice.balance(USD);
+    const cost = chatCostMicro(sheet, 'deepseek/deepseek-v4-pro-0813', raw);
+    const r = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost);
+    assert.equal(r.status, 200, await r.clone().text());
+    assert.equal(alice.balance(USD), before - cost);
+    // A NEW image to a text-only model is still refused, and nothing is charged.
+    const raw2 = JSON.stringify({ model: 'deepseek/deepseek-v4-pro-0813', messages: [{ role: 'user', content: [{ type: 'text', text: 'and this?' }, img] }] });
+    const b2 = alice.balance(USD);
+    const r2 = await alice.pay('POST', '/v1/ai/chat/completions', raw2, chatCostMicro(sheet, 'deepseek/deepseek-v4-pro-0813', raw2));
+    assert.equal(r2.status, 400);
+    assert.equal(alice.balance(USD), b2);
+    // Switching to a model with a smaller context than the chat: refused before payment.
+    const long = JSON.stringify({ model: 'test/tiny-context', messages: [{ role: 'user', content: 'word '.repeat(4000) }] });
+    const b3 = alice.balance(USD);
+    const r3 = await alice.pay('POST', '/v1/ai/chat/completions', long, chatCostMicro(sheet, 'test/tiny-context', long));
+    assert.equal(r3.status, 400);
+    assert.equal((await r3.json()).error.code, 'context_too_long');
+    assert.equal(alice.balance(USD), b3);
+  } finally {
+    for (const m of add) (cfg.MODELS_JSON as { id: string }[]).splice((cfg.MODELS_JSON as { id: string }[]).findIndex((x) => x.id === m.id), 1);
+  }
+});
+
 test('replays are refused (409) and underpaying is refused (402) without losing money', { timeout: 120_000 }, async () => {
   const prices = await alice.prices();
   const cost = BigInt(prices.routes.search.micro_usd);
