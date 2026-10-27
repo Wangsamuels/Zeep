@@ -41,7 +41,6 @@ const Env = z.object({
   OHTTP_PREVIOUS_KEY_ID: z.coerce.number().int().min(0).max(255).default(0),
   // Refuse every API call that doesn't arrive through OHTTP (turn on once the frontend uses it).
   REQUIRE_OHTTP: bool(false),
-  INTERNAL_API_TOKEN: z.string().optional(),
   DB_POOL_MAX: int(10),
   REDIS_TLS_REJECT_UNAUTHORIZED: bool(false),
   STREAM_HEARTBEAT_SEC: int(15),
@@ -78,7 +77,7 @@ const Env = z.object({
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
-    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"rpc100":0.002,"inbox":0.30,"inbox_send":0.01}',
+    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"inbox":0.30,"inbox_send":0.01}',
   ),
   // Models shown in the picker, each with a per-response USD price.
   MODELS_JSON: json(
@@ -218,15 +217,8 @@ const Env = z.object({
   MPP_PARALLEL_URL: z.string().default('https://parallelmpp.dev'),
   MPP_RXATLAS_URL: z.string().default('https://api.rxatlas.dev'),
   MPP_TRIALBASE_URL: z.string().default('https://api.trialbase-db.org'),
-  MPP_ALCHEMY_URL: z.string().default('https://mpp.alchemy.com'),
-  MPP_QUICKNODE_URL: z.string().default('https://mpp.quicknode.com'),
   MPP_STABLEEMAIL_URL: z.string().default('https://stableemail.dev'),
   MPP_AGENTMAIL_URL: z.string().default('https://mpp.api.agentmail.to'),
-  // chain name -> full JSON-RPC URL on an MPP provider; {alchemy}/{quicknode} are substituted
-  RPC_ROUTES_JSON: json(
-    z.record(z.string(), z.string()),
-    '{"ethereum":"{alchemy}/eth-mainnet","base":"{alchemy}/base-mainnet","arbitrum":"{alchemy}/arb-mainnet","solana":"{quicknode}/solana-mainnet"}',
-  ),
   // Which chain backend the Rust workers use. With mock rails on a REAL chain (testnet light
   // client), the treasury simulates conversions in its books and never sends ZEC to fake rails.
   CHAIN_BACKEND: z.enum(['dev', 'rpc', 'lightclient']).default('dev'),

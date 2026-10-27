@@ -904,3 +904,12 @@ test('ohttp: a streamed AI reply arrives intact, in padded batches, with nothing
   assert.match(text, /mock reply/);
   assert.match(sse, /data: \[DONE\]/);
 });
+
+test('removed services stay removed: no chain RPC, no internal gate, no price for them', { timeout: 30_000 }, async () => {
+  for (const [path, body] of [['/v1/rpc/ethereum', '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}'], ['/internal/verify', '{}']] as const) {
+    const r = await http(`${base}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+    assert.ok(r.status === 404 || r.status === 400, `${path} → ${r.status}`);
+  }
+  const p = await (await http(`${base}/v1/prices`)).json();
+  assert.ok(!('rpc100' in p.routes), 'no chain price on the sheet');
+});

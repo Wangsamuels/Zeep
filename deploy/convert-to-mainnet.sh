@@ -40,8 +40,7 @@ heroku addons:create heroku-redis:mini -a "$APP" --wait
 echo "==> New secrets (stored only in Heroku, never printed)"
 heroku config:set -a "$APP" \
   PAYOUT_ADDR_ENC_KEY="$(openssl rand -base64 32)" \
-  RELAY_SHARED_SECRET="$(openssl rand -hex 32)" \
-  INTERNAL_API_TOKEN="$(openssl rand -hex 32)" >/dev/null
+  RELAY_SHARED_SECRET="$(openssl rand -hex 32)" >/dev/null
 echo "    done"
 
 echo "==> Removing testnet-only settings (the old testnet wallet included)"

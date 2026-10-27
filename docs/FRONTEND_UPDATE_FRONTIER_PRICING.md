@@ -49,7 +49,7 @@ const res = await client.pay("POST", "/v1/ai/chat/completions", raw, cost);
 
 ## 5. Daily spending limit (user setting)
 
-Each user has their own daily limit on paid services (AI, search, research, inbox, health, chain). It's **$5 by default**. The limit lives on the user's device, saved with their note book, because Zeep has no accounts and the server can't link a user's payments together.
+Each user has their own daily limit on paid services (AI, search, research, inbox, health). It's **$5 by default**. The limit lives on the user's device, saved with their note book, because Zeep has no accounts and the server can't link a user's payments together.
 
 ```ts
 client.dailySpending();                 // { limit, spent, left }  micro-USD; left = null when there's no limit

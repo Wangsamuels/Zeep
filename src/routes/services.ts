@@ -1,4 +1,4 @@
-// Search, research, health lookup, blockchain RPC and anonymous inbox.
+// Search, research, health lookup and anonymous inbox.
 // Upstream paths that vary by provider are kept in PROVIDERS so they can be adjusted
 // in one place after each day-1 endpoint check.
 import { randomBytes } from 'node:crypto';
@@ -102,20 +102,6 @@ export default async function serviceRoutes(app: FastifyInstance) {
         ).catch(() => undefined);
       }
       return { kind: b.data.kind, data, summary, disclaimer: 'Reference information only, not medical advice.' };
-    });
-  });
-
-  // ---- blockchain RPC (1 credit per 100 calls) ----
-  app.post<{ Params: { chain: string } }>('/v1/rpc/:chain', async (req, reply) => {
-    const tpl = cfg.RPC_ROUTES_JSON[req.params.chain];
-    if (!tpl) throw errors.notFound(`unknown chain; available: ${Object.keys(cfg.RPC_ROUTES_JSON).join(', ')}`);
-    const body = req.body;
-    const calls = Array.isArray(body) ? body.length : body && typeof body === 'object' ? 1 : 0;
-    if (calls < 1 || calls > 1000) throw errors.bad('send one JSON-RPC call or a batch of up to 1000');
-    const c = await chargeRequest(req, reply, Math.ceil(calls / 100) * routeUsd('rpc100'));
-    return withCharge(c, reply, async () => {
-      const url = tpl.replace('{alchemy}', cfg.MPP_ALCHEMY_URL).replace('{quicknode}', cfg.MPP_QUICKNODE_URL);
-      return upstreamJson(await mppFetch('rpc', url, json(body)));
     });
   });
 

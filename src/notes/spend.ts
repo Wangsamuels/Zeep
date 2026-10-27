@@ -79,7 +79,6 @@ export const notesSignal = () => hashToField('zeep-notes-v1');
 export const depositSignal = (intentId: string, d: bigint) => hashToField('zeep-deposit-v1', intentId, d.toString());
 export const convertSignal = (id: string, mintD: bigint, amountMicroUsd: bigint) =>
   hashToField('zeep-convert-v2', id, mintD.toString(), amountMicroUsd.toString());
-export const gateSignal = (method: string, requestDigestHex: string) => hashToField('zeep-gate-v1', method, requestDigestHex);
 
 // ---------- verifying key ----------
 let vkeyPromise: Promise<object> | undefined;

@@ -38,7 +38,6 @@ secret() {
 echo "==> Secrets (generated here, stored only in Heroku)"
 secret PAYOUT_ADDR_ENC_KEY "openssl rand -base64 32"
 secret RELAY_SHARED_SECRET "openssl rand -hex 32"
-secret INTERNAL_API_TOKEN  "openssl rand -hex 32"
 
 if [[ "$NET" == "testnet" ]]; then
   ZN=test; LWD="https://testnet.zec.rocks:443"; RAILS=mock; MPP=mock; BUDGET=5; JWT_NOTE=""

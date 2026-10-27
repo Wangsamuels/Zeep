@@ -11,7 +11,6 @@ import { checkDbNetwork } from './migrate.js';
 import { registry } from './notes/registry.js';
 import { loadVkey } from './notes/spend.js';
 import aiRoutes from './routes/ai.js';
-import internalRoutes from './routes/internal.js';
 import moneyRoutes from './routes/money.js';
 import publicRoutes from './routes/public.js';
 import inboxRoutes from './routes/inbox.js';
@@ -48,7 +47,7 @@ export async function buildApp() {
     reply.header('cache-control', 'no-store');
     reply.header('referrer-policy', 'no-referrer');
     reply.header('x-content-type-options', 'nosniff');
-    if (cfg.REQUIRE_RELAY && !req.url.startsWith('/internal/')) {
+    if (cfg.REQUIRE_RELAY) {
       const relay = req.headers['x-zeep-relay'];
       if (typeof relay !== 'string' || !safeEqual(relay, cfg.RELAY_SHARED_SECRET)) {
         return reply.code(403).send({ error: { code: 'relay_required', message: `use ${cfg.PUBLIC_API_BASE_URL}` } });
@@ -58,7 +57,7 @@ export async function buildApp() {
     // Requests decrypted by the OHTTP gateway carry a per-process marker; nobody else can.
     const inner = isInnerRequest(req.headers['x-zeep-ohttp-inner']);
     delete req.headers['x-zeep-ohttp-inner'];
-    if (cfg.REQUIRE_OHTTP && !inner && req.method !== 'OPTIONS' && !req.url.startsWith('/internal/')) {
+    if (cfg.REQUIRE_OHTTP && !inner && req.method !== 'OPTIONS') {
       const path = req.url.split('?')[0];
       if (path !== '/ohttp' && path !== '/ohttp-keys' && path !== '/v1/status') {
         return reply.code(403).send({ error: { code: 'ohttp_required', message: 'this API only accepts Oblivious HTTP requests; update the app' } });
@@ -100,7 +99,6 @@ export async function buildApp() {
   await app.register(inboxRoutes);
   await app.register(moneyRoutes);
   await app.register(vaultRoutes);
-  await app.register(internalRoutes);
   await registerOhttp(app);
   return app;
 }

@@ -108,7 +108,6 @@ function mockResponse(service: string, url: string): Response {
     search: { results: [{ title: 'Mock result', url: 'https://example.com', snippet: 'mock' }] },
     research: { run_id: 'mock-run', status: 'completed', output: { content: 'mock research report', citations: [] } },
     health: { results: [{ name: 'mock', summary: 'mock record' }] },
-    rpc: { jsonrpc: '2.0', id: 1, result: '0x1' },
     inbox: { inbox_id: `mock-${Date.now()}@example.com`, email: `mock-${Date.now()}@example.com`, inbox: `mock-${Date.now()}@example.com` },
     'inbox-send': { message_id: `mock-sent-${Date.now()}`, thread_id: 'mock-thread-1', messageId: `mock-sent-${Date.now()}` },
     'inbox-delete': { success: true },

@@ -40,7 +40,7 @@ The script does the following:
 
 - creates the app on the container stack;
 - adds Postgres and Redis;
-- **generates the secrets inside Heroku without printing them** (`PAYOUT_ADDR_ENC_KEY`, `RELAY_SHARED_SECRET`, `INTERNAL_API_TOKEN`);
+- **generates the secrets inside Heroku without printing them** (`PAYOUT_ADDR_ENC_KEY`, `RELAY_SHARED_SECRET`);
 - sets every config var that doesn't need your own accounts (table in §6);
 - prints the remaining steps with your app's URL filled in.
 
@@ -133,7 +133,7 @@ heroku ps:scale -a zeep-test web=1 treasury=1 wallet=1:standard-2x watcher=0 pay
 | `RESERVE_HOT_CAP_ZATS` | `50000000` (0.5 ZEC) | `50000000` |
 | `MAX_DEPOSIT_ZATS_PER_DAY` | `200000000` (2 ZEC/day) | `200000000` |
 | `SPEND_VKEY_PATH` / `SPEND_VKEY_SHA256` / `SPEND_ZKEY_SHA256` | `circuits/zeep_spend_vkey.json` + the pinned hashes | same |
-| `PAYOUT_ADDR_ENC_KEY`, `RELAY_SHARED_SECRET`, `INTERNAL_API_TOKEN` | generated | generated (different values) |
+| `PAYOUT_ADDR_ENC_KEY`, `RELAY_SHARED_SECRET` | generated | generated (different values) |
 
 > ⚠️ The circuit files come from a single-contributor setup: whoever ran it could forge proofs. That's acceptable for a capped hackathon deployment (see §8), **not for a real launch**. Run a multi-party ceremony first (README, "Before mainnet").
 
