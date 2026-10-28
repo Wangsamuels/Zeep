@@ -7,6 +7,7 @@
 //   POST /v1/inbox/send               send   (paid: routes.inbox_send)            → { message_id, thread_id }
 //   POST /v1/inbox/reply              reply  (paid: routes.inbox_send)            → { message_id, thread_id }
 //   POST /v1/inbox/messages/delete    delete { inbox_id, message_id }             → { deleted: true }
+//   POST /v1/email/send               send without an inbox (paid: routes.email_send) → { message_id, from }
 import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
@@ -14,7 +15,7 @@ import { cfg } from '../config.js';
 import { q } from '../lib/db.js';
 import { errors, ZeepError } from '../lib/errors.js';
 import { NS, redis } from '../lib/redis.js';
-import { providers, recipients, type InboxRow, type Provider } from '../services/inbox.js';
+import { providers, recipients, sendDirect, type InboxRow, type Provider } from '../services/inbox.js';
 import { routeUsd } from '../services/prices.js';
 import { chargeRequest, withCharge } from './paid.js';
 
@@ -41,7 +42,9 @@ async function limit(kind: string, inboxId: string, max: number, windowSec: numb
     await redis.decrby(key, take);
     throw new ZeepError(429, 'rate_limited', kind === 'send'
       ? `this inbox can send ${max} emails a day; try again tomorrow`
-      : 'too many requests for this inbox; wait a few minutes');
+      : kind === 'direct'
+        ? 'send-only email is busy today; try again tomorrow, or send from your own inbox'
+        : 'too many requests for this inbox; wait a few minutes');
   }
 }
 const release = (kind: string, inboxId: string, windowSec: number, n = 1) =>
@@ -61,6 +64,13 @@ const Send = Body.extend({
   to: z.union([z.string(), z.array(z.string())]),
   cc: z.union([z.string(), z.array(z.string())]).optional(),
   subject: z.string().max(300).default(''),
+});
+const Direct = Body.extend({
+  to: z.union([z.string(), z.array(z.string())]),
+  cc: z.union([z.string(), z.array(z.string())]).optional(),
+  subject: z.string().min(1, 'add a subject').max(300),
+  // Optional: the user's own Zeep inbox, so replies go there.
+  reply_inbox_id: z.string().optional(),
 });
 const Reply = Body.extend({ inbox_id: z.string(), message_id: MSG_ID, reply_all: z.boolean().default(false) });
 const needsBody = (b: { text?: string; html?: string }) => {
@@ -130,6 +140,32 @@ export default async function inboxRoutes(app: FastifyInstance) {
       });
     } catch (e) {
       await release('send', box.id, 86_400);
+      throw e;
+    }
+  });
+
+  // Send-only: no inbox to buy first. Goes out from a shared relay address; recipients can
+  // reply only when the user names one of their own inboxes as the reply address.
+  app.post('/v1/email/send', async (req, reply) => {
+    const p = Direct.safeParse(req.body);
+    if (!p.success) throw errors.bad(p.error.issues[0]?.message ?? 'invalid email');
+    const b = p.data;
+    needsBody(b);
+    const to = recipients(b.to, cfg.INBOX_MAX_RECIPIENTS, 'to');
+    const cc = recipients(b.cc, cfg.INBOX_MAX_RECIPIENTS, 'cc');
+    if (!to.length) throw errors.bad('add at least one recipient');
+    if (to.length + cc.length > cfg.INBOX_MAX_RECIPIENTS) throw errors.bad(`at most ${cfg.INBOX_MAX_RECIPIENTS} recipients in total`);
+    const replyTo = b.reply_inbox_id ? (await inboxOf(b.reply_inbox_id)).address : undefined;
+    await limit('direct', 'all', cfg.EMAIL_SENDS_PER_DAY, 86_400);
+    try {
+      const c = await chargeRequest(req, reply, routeUsd('email_send'));
+      return await withCharge(c, reply, async () => {
+        const sent = await sendDirect({ to, cc, subject: b.subject.replace(/[\r\n]+/g, ' '), text: b.text, html: b.html, replyTo });
+        reply.code(201);
+        return { message_id: sent.id, from: 'relay@stableemail.dev', reply_to: replyTo ?? null };
+      });
+    } catch (e) {
+      await release('direct', 'all', 86_400);
       throw e;
     }
   });

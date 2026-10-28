@@ -207,6 +207,15 @@ export class ZeepClient {
     const cost = BigInt((await this.prices()).routes.inbox_send.micro_usd);
     return this.paidJson("/v1/inbox/send", { inbox_id: inboxId, ...mail }, cost);
   }
+  /**
+   * Paid (routes.email_send): send an email WITHOUT an inbox, from a shared relay address.
+   * Pass `replyInboxId` (one of the user's own inboxes) so recipients can reply.
+   */
+  async sendEmailDirect(mail: { to: string | string[]; cc?: string | string[]; subject: string; text?: string; html?: string; replyInboxId?: string }): Promise<{ message_id: string; from: string; reply_to: string | null }> {
+    const cost = BigInt((await this.prices()).routes.email_send.micro_usd);
+    const { replyInboxId, ...rest } = mail;
+    return this.paidJson("/v1/email/send", { ...rest, ...(replyInboxId ? { reply_inbox_id: replyInboxId } : {}) }, cost);
+  }
   /** Paid (routes.inbox_send): reply to a message (replyAll adds the other recipients). */
   async replyEmail(inboxId: string, messageId: string, mail: { text?: string; html?: string; replyAll?: boolean }): Promise<{ message_id: string; thread_id: string | null }> {
     const cost = BigInt((await this.prices()).routes.inbox_send.micro_usd);

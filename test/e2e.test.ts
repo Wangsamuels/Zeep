@@ -920,7 +920,7 @@ test('removed services stay removed: no chain RPC, no internal gate, no price fo
 test('research (answers and multi-hop tasks) and health lookups work and cost at least the provider price', { timeout: 120_000 }, async () => {
   const p = await alice.prices();
   // What the user pays is at least what the provider charges Zeep (Exa, Parallel, RxAtlas, AgentMail).
-  const floor: Record<string, number> = { search: 7_000, research_base: 10_000, research_core: 50_000, research_pro: 100_000, health: 100_000, inbox: 2_000_000, inbox_send: 10_000 };
+  const floor: Record<string, number> = { email_send: 20_000, search: 7_000, research_base: 10_000, research_core: 50_000, research_pro: 100_000, health: 100_000, inbox: 2_000_000, inbox_send: 10_000 };
   for (const [route, min] of Object.entries(floor)) assert.ok(p.routes[route].micro_usd >= min, `${route} ${p.routes[route].micro_usd} ≥ ${min}`);
   for (const processor of ['base', 'core', 'pro'] as const) {
     const body = JSON.stringify({ query: 'state of fusion energy', processor });
@@ -938,4 +938,20 @@ test('research (answers and multi-hop tasks) and health lookups work and cost at
     assert.equal(r.status, 200, kind);
     assert.ok((await r.json()).data, kind);
   }
+});
+
+test('send-only email: no inbox needed, charged per send, reply address optional, nothing charged on a bad request', { timeout: 120_000 }, async () => {
+  const p = await alice.prices();
+  assert.ok(p.routes.email_send.micro_usd >= 20_000, 'never below StableEmail\'s $0.02');
+  const before = alice.balance(USD);
+  const sent = await alice.sendEmailDirect({ to: 'friend@example.com', subject: 'Hello', text: 'Sent from Zeep without an inbox.' });
+  assert.ok(sent.message_id);
+  assert.equal(sent.reply_to, null);
+  assert.equal(alice.balance(USD), before - BigInt(p.routes.email_send.micro_usd));
+  // Refused BEFORE payment: no subject, a bad address, an unknown reply inbox.
+  const mid = alice.balance(USD);
+  await assert.rejects(alice.sendEmailDirect({ to: 'friend@example.com', subject: '', text: 'x' }));
+  await assert.rejects(alice.sendEmailDirect({ to: 'Friend <friend@example.com>', subject: 's', text: 'x' }));
+  await assert.rejects(alice.sendEmailDirect({ to: 'friend@example.com', subject: 's', text: 'x', replyInboxId: 'ibx_' + 'x'.repeat(32) }));
+  assert.equal(alice.balance(USD), mid);
 });

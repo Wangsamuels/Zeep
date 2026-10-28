@@ -206,6 +206,16 @@ const stableemail = {
   },
 };
 
+/**
+ * Send-only email, no inbox needed: StableEmail's shared relay address ($0.02 a send).
+ * `replyTo` points replies at the user's own Zeep inbox when they have one.
+ */
+export async function sendDirect(o: Outgoing & { replyTo?: string }): Promise<{ id: string }> {
+  const j = await body(await mppFetch('email-send', `${SE()}/api/send`,
+    json({ to: o.to, cc: o.cc.length ? o.cc : undefined, subject: o.subject, text: o.text, html: o.html, replyTo: o.replyTo })));
+  return { id: String(j.messageId ?? '') };
+}
+
 export const providers: Record<Provider, typeof agentmail> = { agentmail, stableemail: stableemail as typeof agentmail };
 
 // ------------------------------------------------------------------ checks shared by routes

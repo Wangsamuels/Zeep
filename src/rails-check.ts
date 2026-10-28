@@ -153,6 +153,7 @@ async function main() {
     ['research_pro', 'Parallel task (pro)', `${cfg.MPP_PARALLEL_URL}/api/task`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"input":"x","processor":"pro"}' }],
     ['health', 'RxAtlas', `${cfg.MPP_RXATLAS_URL}/v1/drugs?q=aspirin&limit=5`, { method: 'GET' }],
     ['health', 'TrialBase', `${cfg.MPP_TRIALBASE_URL}/v1/trials?q=asthma&limit=5`, { method: 'GET' }],
+    ['email_send', 'StableEmail send-only', `${cfg.MPP_STABLEEMAIL_URL}/api/send`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"to":["a@example.com"],"subject":"s","text":"t"}' }],
     ['inbox', 'AgentMail inbox', `${cfg.MPP_AGENTMAIL_URL}/v0/inboxes`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
   ];
   for (const [route, name, url, init] of probes) {

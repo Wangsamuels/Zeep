@@ -171,6 +171,7 @@ function mockResponse(service: string, url: string): Response {
     inbox: { inbox_id: `mock-${Date.now()}@example.com`, email: `mock-${Date.now()}@example.com`, inbox: `mock-${Date.now()}@example.com` },
     'inbox-send': { message_id: `mock-sent-${Date.now()}`, thread_id: 'mock-thread-1', messageId: `mock-sent-${Date.now()}` },
     'inbox-delete': { success: true },
+    'email-send': { success: true, messageId: `mock-direct-${Date.now()}`, from: 'relay@stableemail.dev' },
   };
   if (service === 'inbox-read') {
     const msg = {

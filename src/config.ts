@@ -77,7 +77,7 @@ const Env = z.object({
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
-    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.10,"inbox":2.00,"inbox_send":0.01}',
+    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.10,"inbox":2.00,"inbox_send":0.01,"email_send":0.025}',
   ),
   // Models shown in the picker, each with a per-response USD price.
   MODELS_JSON: json(
@@ -226,6 +226,9 @@ const Env = z.object({
   // Anti-abuse limits per inbox (sending costs money and reputation; reads cost Zeep MPP fees).
   INBOX_SENDS_PER_DAY: int(20),
   INBOX_MAX_RECIPIENTS: int(10),
+  // Send-only email (no inbox) goes out from StableEmail's shared relay address: a global daily
+  // cap protects that sender's reputation (and Zeep's account) from bulk sending.
+  EMAIL_SENDS_PER_DAY: int(500),
   INBOX_READS_PER_HOUR: int(240),
 
   // Self-hosted models (Modal)
@@ -248,6 +251,7 @@ export const PROVIDER_COST_USD: Record<string, number> = {
   health: 0.1, // RxAtlas / TrialBase search page
   inbox: 2.0, // AgentMail inbox
   inbox_send: 0.01, // AgentMail send / reply
+  email_send: 0.02, // StableEmail /api/send (send-only, shared relay address)
 };
 
 export function networkProblems(c: Config): string[] {
