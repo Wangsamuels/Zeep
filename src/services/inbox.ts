@@ -3,7 +3,8 @@
 // secret, sent in request bodies, never in URLs). Message contents pass through and are
 // never stored by Zeep.
 //
-//   agentmail   (default)  https://mpp.api.agentmail.to   full API: list, read, send, reply, delete
+//   agentmail   (default)  https://mpp.api.agentmail.to   list, read, send, reply ($2 per inbox, $0.01 per send);
+//                                                         messages can't be deleted one by one: Zeep hides them
 //   stableemail            https://stableemail.dev        list, read, send; reply = send "Re:";
 //                                                         delete needs a wallet sign-in (SIWX), so
 //                                                         Zeep also hides deleted messages itself
@@ -122,13 +123,13 @@ const agentmail = {
     return { id: String(j.message_id), thread_id: j.thread_id ? String(j.thread_id) : null };
   },
   async reply(ref: string, id: string, o: { text?: string; html?: string; replyAll: boolean }): Promise<{ id: string; thread_id: string | null }> {
-    const j = await body(await mppFetch('inbox-send', amPath(ref, `/messages/${encodeURIComponent(id)}/reply`),
-      json({ text: o.text, html: o.html, reply_all: o.replyAll || undefined })));
+    const j = await body(await mppFetch('inbox-send', amPath(ref, `/messages/${encodeURIComponent(id)}/${o.replyAll ? 'reply-all' : 'reply'}`),
+      json({ text: o.text, html: o.html })));
     return { id: String(j.message_id), thread_id: j.thread_id ? String(j.thread_id) : null };
   },
-  async remove(ref: string, id: string): Promise<boolean> {
-    await body(await mppFetch('inbox-delete', amPath(ref, `/messages/${encodeURIComponent(id)}`), { method: 'DELETE' }));
-    return true;
+  /** AgentMail's MPP gateway has no message delete: Zeep hides it; it goes with the inbox. */
+  async remove(_ref: string, _id: string): Promise<boolean> {
+    return false;
   },
   /** End of life: delete the whole inbox and its mail at the provider. */
   async destroy(ref: string): Promise<void> {

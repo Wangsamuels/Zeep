@@ -39,7 +39,8 @@ export async function chargeRequest(req: FastifyRequest, reply: FastifyReply, pr
  * call is not refundable, so failing requests can't drain the treasury's MPP budget for free.
  */
 export async function withCharge<T>(s: Spent, reply: FastifyReply, fn: () => Promise<T>): Promise<T> {
-  const call = { upstreamPaid: false };
+  // What the user paid caps what Zeep may pay the provider for this request (see mppFetch).
+  const call = { upstreamPaid: false, maxUsd: Number(s.cost) / 1e6, spentUsd: 0 };
   try {
     return await chargeCtx.run(call, fn);
   } catch (e) {

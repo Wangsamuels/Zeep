@@ -174,7 +174,7 @@ test('pay for search and streamed AI in dollars with real proofs; the server nev
   assert.ok(!cols.some((c) => /balance/.test(c.column_name) && !/reserve/.test(c.column_name)));
 });
 
-test('metered frontier model: the app pays exactly the SDK price; a cheaper proof is refused', { timeout: 120_000 }, async () => {
+test('metered frontier model: the app pays exactly the price; a cheaper proof is refused and corrected once', { timeout: 120_000 }, async () => {
   (cfg.MODELS_JSON as unknown[]).push({ id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', host: 'mpp', usd: 0, vision: true, detail: '', testnet: true,
     in_usd_per_m: 2, out_usd_per_m: 10, min_usd: 0.012, default_output: 4096, max_output: 16000 });
   try {
@@ -183,12 +183,15 @@ test('metered frontier model: the app pays exactly the SDK price; a cheaper proo
     assert.ok(listed.metered && listed.micro_usd > 40_000); // "from" price at the default 4096-token cap
     const raw = JSON.stringify({ model: listed.id, max_tokens: 512, messages: [{ role: 'user', content: 'word '.repeat(2000) }] });
     const cost = chatCostMicro(sheet, listed.id, raw);
-    const short = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost - 1n);
-    assert.equal(short.status, 402);
+    // A proof below the price is refused (nothing spent); the SDK then pays the exact price the
+    // server names, once. This is how a reply the gateway counts higher than the app gets priced.
     const before = alice.balance(USD);
+    const fixed = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost - 1n);
+    assert.equal(fixed.status, 200, await fixed.clone().text());
+    assert.equal(alice.balance(USD), before - cost, 'charged exactly the price, once');
     const ok = await alice.pay('POST', '/v1/ai/chat/completions', raw, cost);
     assert.equal(ok.status, 200, await ok.clone().text());
-    assert.equal(alice.balance(USD), before - cost);
+    assert.equal(alice.balance(USD), before - 2n * cost);
   } finally {
     (cfg.MODELS_JSON as { id: string }[]).splice((cfg.MODELS_JSON as { id: string }[]).findIndex((m) => m.id === 'anthropic/claude-sonnet-5.5'), 1);
   }
@@ -912,4 +915,27 @@ test('removed services stay removed: no chain RPC, no internal gate, no price fo
   }
   const p = await (await http(`${base}/v1/prices`)).json();
   assert.ok(!('rpc100' in p.routes), 'no chain price on the sheet');
+});
+
+test('research (answers and multi-hop tasks) and health lookups work and cost at least the provider price', { timeout: 120_000 }, async () => {
+  const p = await alice.prices();
+  // What the user pays is at least what the provider charges Zeep (Exa, Parallel, RxAtlas, AgentMail).
+  const floor: Record<string, number> = { search: 7_000, research_base: 10_000, research_core: 50_000, research_pro: 100_000, health: 100_000, inbox: 2_000_000, inbox_send: 10_000 };
+  for (const [route, min] of Object.entries(floor)) assert.ok(p.routes[route].micro_usd >= min, `${route} ${p.routes[route].micro_usd} ≥ ${min}`);
+  for (const processor of ['base', 'core', 'pro'] as const) {
+    const body = JSON.stringify({ query: 'state of fusion energy', processor });
+    const r = await alice.pay('POST', '/v1/research', body, BigInt(p.routes[`research_${processor}`].micro_usd));
+    assert.equal(r.status, 202, processor);
+    const { job_id } = await r.json();
+    const done = await until(async () => {
+      const j = await (await http(`${base}/v1/jobs/${job_id}`)).json();
+      return j.status === 'completed' ? j : undefined;
+    });
+    assert.match(done.result.content, /mock research report/, processor);
+  }
+  for (const kind of ['drug', 'trial'] as const) {
+    const r = await alice.pay('POST', '/v1/health/lookup', JSON.stringify({ kind, query: 'aspirin', summarize: false }), BigInt(p.routes.health.micro_usd));
+    assert.equal(r.status, 200, kind);
+    assert.ok((await r.json()).data, kind);
+  }
 });

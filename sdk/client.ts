@@ -427,6 +427,20 @@ export class ZeepClient {
 
   pay(method: string, path: string, body: string, costMicroUsd: bigint, extraHeaders: Record<string, string> = {}): Promise<Response> {
     return this.exclusive(async () => {
+      const res = await this.payOnce(method, path, body, costMicroUsd, extraHeaders);
+      // AI replies are priced from the provider's own token count, which can be a little above
+      // the app's estimate. The server then names the exact price (nothing was spent): pay it once.
+      if (res.status === 402 && path === "/v1/ai/chat/completions") {
+        const err = (await res.clone().json().catch(() => null))?.error;
+        const need = err?.code === "underpaid" && err.min_cost_micro_usd != null ? BigInt(err.min_cost_micro_usd) : 0n;
+        if (need > costMicroUsd && need <= costMicroUsd * 2n) return this.payOnce(method, path, body, need, extraHeaders);
+      }
+      return res;
+    });
+  }
+
+  private async payOnce(method: string, path: string, body: string, costMicroUsd: bigint, extraHeaders: Record<string, string>): Promise<Response> {
+    {
       // The user's own daily limit (checked here, on their device; Zeep can't link payments).
       const { left } = this.dailySpending();
       if (left !== null && costMicroUsd > left) {
@@ -466,7 +480,7 @@ export class ZeepClient {
       } finally {
         inputs.forEach((n) => (n.pending = false));
       }
-    });
+    }
   }
 
   /** After a network error we can't tell if the spend landed: look for our outputs in the tree. */

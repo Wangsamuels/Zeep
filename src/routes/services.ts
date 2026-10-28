@@ -21,19 +21,37 @@ const json = (body: unknown): RequestInit => ({
 
 export const PROVIDERS = {
   exaSearch: (b: { query: string; n: number }) => [`${cfg.MPP_EXA_URL}/search`, json({ query: b.query, numResults: b.n, contents: { text: { maxCharacters: 1000 } } })] as const,
-  braveSearch: (b: { query: string; n: number }) => [`${cfg.MPP_BRAVE_URL}/res/v1/web/search?q=${encodeURIComponent(b.query)}&count=${b.n}`, { method: 'GET' }] as const,
-  parallelCreate: (input: string, processor: string) => [`${cfg.MPP_PARALLEL_URL}/v1/tasks/runs`, json({ input, processor })] as const,
-  parallelStatus: (runId: string) => `${cfg.MPP_PARALLEL_URL}/v1/tasks/runs/${encodeURIComponent(runId)}`,
-  parallelResult: (runId: string) => `${cfg.MPP_PARALLEL_URL}/v1/tasks/runs/${encodeURIComponent(runId)}/result`,
-  rxatlas: (query: string) => `${cfg.MPP_RXATLAS_URL}/v1/drugs/search?q=${encodeURIComponent(query)}`,
-  trialbase: (query: string) => `${cfg.MPP_TRIALBASE_URL}/v1/trials/search?q=${encodeURIComponent(query)}`,
+  // Parallel over MPP: cited answers (/api/responses, $0.01 low / $0.05 medium) for base/core,
+  // a multi-hop task (/api/task, $0.10 pro) for pro. Polling a task is free.
+  parallelAnswer: (input: string, effort: 'low' | 'medium') => [`${cfg.MPP_PARALLEL_URL}/api/responses`, json({ input, reasoning: { effort } })] as const,
+  parallelTask: (input: string) => [`${cfg.MPP_PARALLEL_URL}/api/task`, json({ input, processor: 'pro' })] as const,
+  parallelStatus: (runId: string) => `${cfg.MPP_PARALLEL_URL}/api/task/${encodeURIComponent(runId)}`,
+  // $0.10 per search page each.
+  rxatlas: (query: string) => `${cfg.MPP_RXATLAS_URL}/v1/drugs?q=${encodeURIComponent(query)}&limit=5`,
+  trialbase: (query: string) => `${cfg.MPP_TRIALBASE_URL}/v1/trials?q=${encodeURIComponent(query)}&limit=5`,
 };
+
+/** Text and citations from an OpenAI-format Response or a Parallel task result. */
+function researchResult(r: any): { content: string; citations: unknown[] } {
+  const o = r?.result ?? r;
+  if (typeof o?.output_text === 'string') return { content: o.output_text, citations: o.citations ?? [] };
+  if (Array.isArray(o?.output)) {
+    const parts = o.output.flatMap((x: any) => (Array.isArray(x?.content) ? x.content : []));
+    const content = parts.map((p: any) => p?.text ?? '').join('');
+    const citations = parts.flatMap((p: any) => (Array.isArray(p?.annotations) ? p.annotations : []));
+    return { content, citations };
+  }
+  const out = o?.output ?? o;
+  if (typeof out === 'string') return { content: out, citations: [] };
+  return { content: typeof out?.content === 'string' ? out.content : JSON.stringify(out?.content ?? out), citations: out?.basis ?? out?.citations ?? [] };
+}
 
 
 export default async function serviceRoutes(app: FastifyInstance) {
   // ---- search (2 credits) ----
   const Search = z.object({
     query: z.string().min(1).max(500),
+    // Only Exa: Brave over MPP costs 3.5× the search price. 'brave' is accepted and served by Exa.
     provider: z.enum(['exa', 'brave']).default('exa'),
     num_results: z.number().int().min(1).max(20).default(8),
   });
@@ -42,14 +60,10 @@ export default async function serviceRoutes(app: FastifyInstance) {
     if (!b.success) throw errors.bad('invalid search request');
     const c = await chargeRequest(req, reply, routeUsd('search'));
     return withCharge(c, reply, async () => {
-      const [url, init] = b.data.provider === 'exa'
-        ? PROVIDERS.exaSearch({ query: b.data.query, n: b.data.num_results })
-        : PROVIDERS.braveSearch({ query: b.data.query, n: b.data.num_results });
+      const [url, init] = PROVIDERS.exaSearch({ query: b.data.query, n: b.data.num_results });
       const j = (await upstreamJson(await mppFetch('search', url, init))) as any;
-      const results = b.data.provider === 'exa'
-        ? (j.results ?? []).map((r: any) => ({ title: r.title, url: r.url, snippet: r.text ?? r.snippet, published: r.publishedDate }))
-        : (j.web?.results ?? j.results ?? []).map((r: any) => ({ title: r.title, url: r.url, snippet: r.description ?? r.snippet }));
-      return { provider: b.data.provider, results };
+      const results = (j.results ?? []).map((r: any) => ({ title: r.title, url: r.url, snippet: r.text ?? r.snippet, published: r.publishedDate }));
+      return { provider: 'exa', results };
     });
   });
 
@@ -60,10 +74,19 @@ export default async function serviceRoutes(app: FastifyInstance) {
     if (!b.success) throw errors.bad('invalid research request');
     const c = await chargeRequest(req, reply, researchUsd(b.data.processor));
     return withCharge(c, reply, async () => {
-      const [url, init] = PROVIDERS.parallelCreate(b.data.query, b.data.processor);
-      const j = (await upstreamJson(await mppFetch('research', url, init))) as any;
       const jobId = randomBytes(16).toString('hex');
-      await redis.set(keys.job(jobId), JSON.stringify({ kind: 'research', run_id: j.run_id ?? j.id }), 'EX', 86_400);
+      if (b.data.processor === 'pro') {
+        const [url, init] = PROVIDERS.parallelTask(b.data.query);
+        const j = (await upstreamJson(await mppFetch('research', url, init))) as any;
+        const runId = j.run_id ?? j.id;
+        if (!runId) throw errors.busy('research did not start');
+        await redis.set(keys.job(jobId), JSON.stringify({ kind: 'research', run_id: runId }), 'EX', 86_400);
+      } else {
+        // Answers come back in one call; stored as a finished job so the app polls the same way.
+        const [url, init] = PROVIDERS.parallelAnswer(b.data.query, b.data.processor === 'base' ? 'low' : 'medium');
+        const j = await upstreamJson(await mppFetch('research', url, init));
+        await redis.set(keys.job(jobId), JSON.stringify({ kind: 'research', run_id: '', result: researchResult(j) }), 'EX', 86_400);
+      }
       reply.code(202);
       return { job_id: jobId, status: 'running', poll: `/v1/jobs/${jobId}` };
     });
@@ -77,8 +100,7 @@ export default async function serviceRoutes(app: FastifyInstance) {
     const s = (await upstreamJson(await mppFetch('research', PROVIDERS.parallelStatus(job.run_id), { method: 'GET' }))) as any;
     const status = String(s.status ?? 'running');
     if (status === 'completed') {
-      const r = (await upstreamJson(await mppFetch('research', PROVIDERS.parallelResult(job.run_id), { method: 'GET' }))) as any;
-      job.result = r.output ?? r;
+      job.result = researchResult(s);
       await redis.set(keys.job(req.params.id), JSON.stringify(job), 'EX', 86_400);
       return { job_id: req.params.id, status, result: job.result };
     }

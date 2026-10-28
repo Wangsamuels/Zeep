@@ -8,8 +8,8 @@ import { z } from 'zod';
 import { cfg } from '../config.js';
 import { errors, ZeepError } from '../lib/errors.js';
 import { modalFetch } from '../services/modal.js';
-import { mppFetch } from '../services/mpp.js';
-import { chatQuote, IMAGE_PLACEHOLDER, isMetered, modelById, priceSheet } from '../services/prices.js';
+import { mppFetch, mppQuoteUsd } from '../services/mpp.js';
+import { chatQuote, IMAGE_PLACEHOLDER, isMetered, modelById, priceSheet, requiredMicroUsd } from '../services/prices.js';
 import { chargeRequest, pipeSse, upstreamJson, withCharge } from './paid.js';
 
 // Text, or OpenAI content parts: text and images (data: URLs, so nothing is fetched by URL).
@@ -63,19 +63,25 @@ export default async function aiRoutes(app: FastifyInstance) {
       throw new ZeepError(400, 'context_too_long', `This chat is too long for ${model.name}; start a new chat or drop older messages`,
         { max_input_tokens: model.context - (quote.maxTokens ?? 0), estimated_input_tokens: quote.inputTokens });
     }
-    const s = await chargeRequest(req, reply, { micro: quote.micro });
+    const gateway = model.gateway ?? (model.id.startsWith('openai/') ? 'openai' : 'openrouter');
+    const upstreamModel = model.upstream ?? (gateway === 'openai' ? model.id.replace(/^openai\//, '') : model.id);
+    // The output cap is part of the price: always forward it, so the upstream can't run longer.
+    const out = { ...body, model: upstreamModel, ...(quote.maxTokens !== undefined ? { max_tokens: quote.maxTokens } : {}) };
+    const url = gateway === 'openai' ? `${cfg.MPP_OPENAI_URL}/v1/chat/completions` : `${cfg.MPP_OPENROUTER_URL}/v1/chat/completions`;
+    const upstreamBody = JSON.stringify(out);
+    // Metered models: ask the gateway what this exact request costs (free, no payment), and
+    // never charge less. The gateway's own token count can exceed our estimate (digits, code).
+    let micro = quote.micro;
+    if (model.host === 'mpp' && isMetered(model) && cfg.MPP_MODE === 'live' && req.headers['x-zeep-proof']) {
+      const gatewayUsd = await mppQuoteUsd(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: upstreamBody });
+      micro = Math.max(micro, requiredMicroUsd(gatewayUsd));
+    }
+    const s = await chargeRequest(req, reply, { micro });
     return withCharge(s, reply, async () => {
-      const gateway = model.gateway ?? (model.id.startsWith('openai/') ? 'openai' : 'openrouter');
-      const upstreamModel = model.upstream ?? (gateway === 'openai' ? model.id.replace(/^openai\//, '') : model.id);
-      // The output cap is part of the price: always forward it, so the upstream can't run longer.
-      const out = { ...body, model: upstreamModel, ...(quote.maxTokens !== undefined ? { max_tokens: quote.maxTokens } : {}) };
       const long = out.stream ? AbortSignal.timeout(10 * 60_000) : undefined;
       let res: Response;
       if (model.host === 'zeep') res = await modalFetch('/v1/chat/completions', out, long);
-      else {
-        const url = gateway === 'openai' ? `${cfg.MPP_OPENAI_URL}/v1/chat/completions` : `${cfg.MPP_OPENROUTER_URL}/v1/chat/completions`;
-        res = await mppFetch('ai-frontier', url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(out), signal: long });
-      }
+      else res = await mppFetch('ai-frontier', url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: upstreamBody, signal: long });
       if (out.stream && res.ok && res.headers.get('content-type')?.includes('text/event-stream')) return pipeSse(reply, res);
       const json = (await upstreamJson(res)) as Record<string, unknown>;
       if (json && typeof json === 'object') json.model = model.id;

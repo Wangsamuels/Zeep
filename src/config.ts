@@ -77,7 +77,7 @@ const Env = z.object({
   // Route prices in USD; charged in zats at the live ZEC price (NEAR Intents token feed).
   SERVICE_PRICES_USD_JSON: json(
     z.record(z.string(), z.number().nonnegative()),
-    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.005,"inbox":0.30,"inbox_send":0.01}',
+    '{"search":0.01,"research_base":0.03,"research_core":0.06,"research_pro":0.20,"health":0.10,"inbox":2.00,"inbox_send":0.01}',
   ),
   // Models shown in the picker, each with a per-response USD price.
   MODELS_JSON: json(
@@ -239,6 +239,17 @@ export type Config = z.infer<typeof Env>;
  * Testnet and mainnet must never mix: one network per app, database and Redis, and mainnet
  * only with real rails, a pinned verifying key and live prices. Returns the problems found.
  */
+/** What each paid route costs Zeep upstream, per call (provider 402 prices). */
+export const PROVIDER_COST_USD: Record<string, number> = {
+  search: 0.007, // Exa /search
+  research_base: 0.01, // Parallel /api/responses, low
+  research_core: 0.05, // Parallel /api/responses, medium
+  research_pro: 0.1, // Parallel /api/task, pro
+  health: 0.1, // RxAtlas / TrialBase search page
+  inbox: 2.0, // AgentMail inbox
+  inbox_send: 0.01, // AgentMail send / reply
+};
+
 export function networkProblems(c: Config): string[] {
   const p: string[] = [];
   const main = c.ZEEP_ENV === 'mainnet';
@@ -248,9 +259,12 @@ export function networkProblems(c: Config): string[] {
   const taddr = main ? /^t1[1-9A-HJ-NP-Za-km-z]{33}$/ : /^tm[1-9A-HJ-NP-Za-km-z]{33}$/;
   if (c.ZEEP_RESERVE_TADDR && !taddr.test(c.ZEEP_RESERVE_TADDR)) p.push(`ZEEP_RESERVE_TADDR is not a ${c.ZCASH_NETWORK}net transparent (P2PKH) address`);
   if (c.TREASURY_REFUND_TO && !taddr.test(c.TREASURY_REFUND_TO)) p.push(`TREASURY_REFUND_TO is not a ${c.ZCASH_NETWORK}net transparent address`);
-  // StableEmail charges Zeep $1 per 30-day inbox: never sell one for less.
-  if (c.INBOX_PROVIDER === 'stableemail' && (c.SERVICE_PRICES_USD_JSON.inbox ?? 0) < 1) {
-    p.push('INBOX_PROVIDER=stableemail costs $1 per inbox: set "inbox" to at least 1.00 in SERVICE_PRICES_USD_JSON');
+  // Never sell a call for less than the provider charges Zeep (checked against their live 402
+  // prices, Oct 2026). mppFetch also refuses to pay more than the user paid, as a backstop.
+  if (c.INBOX_PROVIDER === 'stableemail') p.push('INBOX_PROVIDER=stableemail charges for every inbox read, which Zeep gives away free: use agentmail');
+  for (const [route, min] of Object.entries(PROVIDER_COST_USD)) {
+    const price = c.SERVICE_PRICES_USD_JSON[route];
+    if (price !== undefined && price < min) p.push(`SERVICE_PRICES_USD_JSON.${route} is ${price}, below the provider's price of ${min}`);
   }
   for (const k of ['OHTTP_PRIVATE_KEY', 'OHTTP_PREVIOUS_PRIVATE_KEY'] as const) {
     const v = c[k];

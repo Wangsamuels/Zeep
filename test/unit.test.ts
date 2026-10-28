@@ -345,3 +345,57 @@ test('ohttp: request and response round-trip; key configs parse; tampering is ca
   const flipped = sealed.slice(); flipped[60] ^= 1;
   assert.throws(() => ohttp.openRequest(flipped, () => sk));
 });
+
+// ------------------------------------------------------------------ provider prices (money-loss guards)
+test('providers: Zeep never pays a provider more than the user paid, and free routes pay nothing', async () => {
+  const { mayPay } = await import('../src/services/mpp.js');
+  assert.equal(mayPay(undefined, 0), true); // zero-amount auth challenges (AgentMail reads) are fine
+  assert.equal(mayPay(undefined, 0.001), false); // a free route never pays
+  assert.equal(mayPay({ maxUsd: 0.0418 }, 0.04), true);
+  assert.equal(mayPay({ maxUsd: 0.0418 }, 0.0455), false); // gateway counted more tokens than we charged
+  assert.equal(mayPay({ maxUsd: 2.09 }, 2.0), true);
+  assert.equal(mayPay({ maxUsd: 0.3135 }, 2.0), false); // the old $0.30 inbox vs AgentMail's $2
+  assert.equal(mayPay({ maxUsd: 0.05, spentUsd: 0.04 }, 0.02), false); // across several payments
+});
+
+test('providers: prices can never be set below what the provider charges', () => {
+  const base = { ...cfg, ZEEP_ENV: 'testnet' as const, ZCASH_NETWORK: 'test' as const };
+  assert.deepEqual(networkProblems(base).filter((m) => /provider|stableemail/i.test(m)), []); // defaults are safe
+  for (const [route, low] of [['inbox', 0.3], ['health', 0.005], ['research_core', 0.04], ['search', 0.005]] as const) {
+    const p = networkProblems({ ...base, SERVICE_PRICES_USD_JSON: { ...cfg.SERVICE_PRICES_USD_JSON, [route]: low } }).join();
+    assert.match(p, new RegExp(`${route} is ${low}, below the provider`));
+  }
+  assert.match(networkProblems({ ...base, INBOX_PROVIDER: 'stableemail' }).join(), /stableemail charges for every inbox read/);
+});
+
+test('providers: the AI price check reads the USDC.e offer from a 402 without paying', async () => {
+  const { createServer } = await import('node:http');
+  const { mppQuoteUsd } = await import('../src/services/mpp.js');
+  const offer = (intent: string, amount: string, currency: string) =>
+    `Payment id="x", realm="r", method="tempo", intent="${intent}", request="${Buffer.from(JSON.stringify({ amount, currency })).toString('base64url')}"`;
+  let mode = 402;
+  let calls = 0;
+  const srv = createServer((req, res) => {
+    calls++;
+    if (req.headers.authorization) throw new Error('the probe must never send a payment');
+    if (mode === 402) {
+      res.writeHead(402, { 'www-authenticate': [offer('charge', '41000', cfg.TEMPO_USDC_E), offer('session', '45484', cfg.TEMPO_USDC_E.toLowerCase()), offer('session', '99000000', '0x20c000000000000000000000f37de3740ADec032')].join(', ') });
+      return res.end('{}');
+    }
+    res.writeHead(mode, { 'content-type': 'application/json' });
+    res.end('{"error":"bad model"}');
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}/v1/chat/completions`;
+  const init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' };
+  try {
+    assert.equal(await mppQuoteUsd(url, init), 0.045484); // the dearest USDC.e offer; other tokens ignored
+    mode = 400;
+    await assert.rejects(mppQuoteUsd(url, init), (e: { status: number }) => e.status === 400); // refused before payment
+    mode = 502;
+    await assert.rejects(mppQuoteUsd(url, init), (e: { status: number }) => e.status === 503);
+    assert.equal(calls, 3);
+  } finally {
+    srv.close();
+  }
+});

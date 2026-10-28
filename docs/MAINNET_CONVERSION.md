@@ -187,6 +187,28 @@ Without it, Cloudflare sees each user's IP next to what they do. With it, Cloudf
 - update Vercel and redeploy;
 - remove the previous key a day later.
 
+## 10. Live dry run of the money rails and providers
+
+```bash
+heroku run -a zeep-test -- node dist/rails-check.js
+```
+
+Nothing is signed or sent. It checks:
+
+- the ZEC price feed, the float on Tempo, USDC on Base, and Base gas;
+- NEAR Intents quotes both ways, using your reserve address;
+- Relay quotes both ways, plus a simulated bridge-back transaction from the treasury;
+- that the reserve wallet is synced, and that no payout or conversion is stuck;
+- each paid provider's live price against what Zeep charges.
+
+Every line is `PASS`, `WARN` or `FAIL`. Run it after any config change, and before you announce the app.
+
+**What protects the treasury from provider prices:**
+
+- AI replies are priced from the gateway's own quote for the exact request, never below it.
+- Zeep never pays a provider more than the user paid for that request. Free routes never pay anything.
+- The config refuses any route price below the provider's price.
+
 ## Safety limits (already set)
 
 | Setting | Value |
