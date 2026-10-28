@@ -27,6 +27,8 @@ export interface Rails {
   /** 1Click quote Base USDC → ZEC delivered to the reserve's t-address. Returns an EVM deposit address. */
   quoteBaseToZec(usdc: bigint): Promise<{ depositAddress: string }>;
   swapStatus(depositAddress: string): Promise<{ status: Status; amountOut?: bigint }>;
+  /** Dry 1Click quote (nothing created): would Base USDC → ZEC accept this amount? */
+  canSwapBaseToZec(usdc: bigint): Promise<boolean>;
   /** Send Base USDC to a 1Click deposit address. */
   payBaseUsdc(depositAddress: string, usdc: bigint): Promise<void>;
   /** Bridge `usdc` (exact input). Returns the Relay request id and the USDC the destination will receive. */
@@ -98,6 +100,30 @@ const live: Rails = {
     } as QuoteRequest);
     if (!qr.quote.depositAddress) throw new Error('1Click returned no deposit address');
     return { depositAddress: qr.quote.depositAddress };
+  },
+
+  async canSwapBaseToZec(usdc) {
+    oneClick();
+    try {
+      await OneClickService.getQuote({
+        dry: true,
+        swapType: QuoteRequest.swapType.EXACT_INPUT,
+        slippageTolerance: cfg.TREASURY_SLIPPAGE_BPS,
+        originAsset: baseUsdcAsset(),
+        depositType: QuoteRequest.depositType.ORIGIN_CHAIN,
+        destinationAsset: cfg.TREASURY_SWAP_ORIGIN_ASSET,
+        amount: usdc.toString(),
+        refundTo: account().address,
+        refundType: QuoteRequest.refundType.ORIGIN_CHAIN,
+        recipient: need('ZEEP_RESERVE_TADDR'),
+        recipientType: QuoteRequest.recipientType.DESTINATION_CHAIN,
+        deadline: deadline(),
+      } as QuoteRequest);
+      return true;
+    } catch (e) {
+      if (/too low/i.test(String((e as { body?: { message?: string } }).body?.message ?? (e as Error).message))) return false;
+      throw e;
+    }
   },
 
   async swapStatus(depositAddress) {
@@ -193,6 +219,9 @@ async function mockPrice(): Promise<number> {
 const devHeight = () => Math.floor((Date.now() / 1000 - Number(process.env.DEV_GENESIS_UNIX ?? 1_760_000_000)) / Number(process.env.DEV_BLOCK_SECS ?? 75));
 
 const mock: Rails = {
+  async canSwapBaseToZec(usdc) {
+    return usdc >= 1_000_000n; // NEAR's live minimum is ~$1.70
+  },
   async balances() {
     const [r] = await q<{ tempo_usdc: string }>('SELECT tempo_usdc FROM dev_rails WHERE id = 1');
     return { tempoUsdc: BigInt(r.tempo_usdc), baseUsdc: mockBase };

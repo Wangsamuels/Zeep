@@ -54,9 +54,13 @@ export async function floatTick(): Promise<FloatAction> {
   const a = decide({ zecSpendable: BigInt(w.s ?? 0), pendingZecPayouts: BigInt(p.z), zecOwed: BigInt(await zecOwedZats()), inflightToTempo: open.some((o) => o.direction === 'to_tempo') });
   if (a.action === 'to_tempo') {
     const px = (await moneyQuote().catch(() => null))?.usd; // books the conversion at a live price
-    if (px === undefined) return { action: 'none', why: 'no live ZEC price' };
-    const { depositAddress } = await r.quoteZecToBase(a.zats);
-    await tx(async (c) => {
+    // A failed quote moves nothing: skip this tick, but still run withdrawals and open steps.
+    const quote = px === undefined ? null : await r.quoteZecToBase(a.zats).catch((e) => {
+      log.warn({ zats: a.zats.toString(), err: (e as Error).message }, 'ZEC → USDC quote failed; will retry');
+      return null;
+    });
+    if (px !== undefined && quote) await tx(async (c) => {
+      const { depositAddress } = quote;
       const pay = await c.query<{ id: string }>(
         `INSERT INTO payouts (kind, dest_address, amount_zats, scheduled_at) VALUES ('conversion', $1, $2, now()) RETURNING id`,
         [depositAddress, a.zats.toString()]);
@@ -65,7 +69,7 @@ export async function floatTick(): Promise<FloatAction> {
          VALUES ('to_tempo', 'surplus', 'zec_sending', $1, $2, $3, $4)`,
         [a.zats.toString(), px, depositAddress, pay.rows[0].id]);
     });
-    log.info({ zats: a.zats.toString() }, 'float: converting surplus ZEC → USDC.e');
+    if (quote) log.info({ zats: a.zats.toString() }, 'float: converting surplus ZEC → USDC.e');
   }
 
   // Each withdrawal waiting for ZEC gets its own conversion back. One attempt only: a
@@ -78,6 +82,17 @@ export async function floatTick(): Promise<FloatAction> {
     const usdc = BigInt(wd.convert_micro_usd); // USDC has 6 decimals: 1 unit = 1 micro-USD
     if (usdc > tempoUsdc) {
       log.error({ withdrawal: wd.id }, 'ALERT Tempo float too small for a withdrawal; top up USDC.e');
+      continue;
+    }
+    // NEAR Intents must accept what arrives on Base (after Relay's fee) BEFORE anything is
+    // bridged; otherwise the USDC would sit on Base with nowhere to go.
+    const ok = await r.canSwapBaseToZec((usdc * 97n) / 100n).catch((e) => {
+      log.warn({ withdrawal: wd.id, err: (e as Error).message }, 'NEAR Intents check failed; will retry');
+      return null;
+    });
+    if (ok === null) continue;
+    if (!ok) {
+      log.error({ withdrawal: wd.id, usdc: usdc.toString() }, 'ALERT credits too small for NEAR Intents to convert back; nothing moved, pay this withdrawal by hand');
       continue;
     }
     // Record the intent BEFORE moving money, so a crash mid-bridge can't cause a second bridge.

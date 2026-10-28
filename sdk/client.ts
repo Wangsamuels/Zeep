@@ -620,7 +620,8 @@ export class ZeepClient {
   private async planGross(zats: bigint | "all"): Promise<Omit<WithdrawalPlan, "networkFeeZats" | "networkFeesCovered">> {
     const conf = this.conf ?? (await this.config());
     const feeBps = BigInt(conf.split.conversion_fee_bps.usd_to_zec);
-    const minUsd = BigInt(conf.withdrawals.min_micro_usd);
+    // Credits converted back to ZEC have their own, higher minimum (bridge minimums and fees).
+    const minUsd = BigInt(conf.withdrawals.min_convert_micro_usd ?? conf.withdrawals.min_micro_usd);
     const px = (await this.prices()).zec_usd as number;
     const { usd, zec } = this.balances();
     if (zats === "all") {

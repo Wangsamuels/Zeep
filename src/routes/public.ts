@@ -57,6 +57,7 @@ export default async function publicRoutes(app: FastifyInstance) {
       nullifier_bucket_bits: cfg.NULLIFIER_BUCKET_BITS,
       withdrawals: {
         min_micro_usd: cfg.MIN_WITHDRAWAL_MICRO_USD,
+        min_convert_micro_usd: cfg.MIN_CONVERT_BACK_MICRO_USD, // credits converted back to ZEC
         fee_bps: cfg.WITHDRAWAL_FEE_BPS,
         network_fee_zats_per_tranche: cfg.REFUND_NETWORK_FEE_ZATS,
         split_bps: cfg.REFUND_SPLIT_BPS,

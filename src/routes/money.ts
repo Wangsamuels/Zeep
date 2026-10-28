@@ -309,7 +309,7 @@ export default async function moneyRoutes(app: FastifyInstance) {
     const px = (await moneyQuote()).usd;
     const total = zatsToMicroUsd(zecZats, px) + usdMicro;
     if (total < cfg.MIN_WITHDRAWAL_MICRO_USD) throw errors.bad(`withdrawals must be worth at least ${cfg.MIN_WITHDRAWAL_MICRO_USD} micro-USD`);
-    if (ub && usdMicro < cfg.MIN_WITHDRAWAL_MICRO_USD) throw errors.bad(`the credits converted back must be at least ${cfg.MIN_WITHDRAWAL_MICRO_USD} micro-USD`);
+    if (ub && usdMicro < cfg.MIN_CONVERT_BACK_MICRO_USD) throw errors.bad(`the credits converted back must be at least ${cfg.MIN_CONVERT_BACK_MICRO_USD} micro-USD`, { min_convert_micro_usd: cfg.MIN_CONVERT_BACK_MICRO_USD });
     if ((await q('SELECT 1 FROM withdrawals WHERE id = $1', [id])).length) throw errors.tagUsed();
     const networkZats = 2 * cfg.REFUND_NETWORK_FEE_ZATS;
     const networkMicro = zatsToMicroUsd(networkZats, px);

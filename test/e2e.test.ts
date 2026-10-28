@@ -735,11 +735,22 @@ test('adversarial: two devices spend the same notes at once (service + withdrawa
   const deviceB = new ZeepClient({ baseUrl: base, keys: mKeys, book: bookB, prove: nodeProve, fetch: http });
   const usd = mallory.balance(USD);
   const cost = BigInt((await mallory.prices()).routes.search.micro_usd);
-  const plan = await deviceB.planWithdrawal('all');
-  const [pay, wd] = await Promise.allSettled([
-    mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'device A' }), cost),
-    deviceB.withdraw(plan, SAPLING),
-  ]);
+  // Mallory's credits (~$4.9) are under the $5 convert-back minimum; lower it so device B's
+  // withdrawal really races device A for the same dollar notes.
+  const c = cfg as { MIN_CONVERT_BACK_MICRO_USD: number };
+  const savedMin = c.MIN_CONVERT_BACK_MICRO_USD;
+  c.MIN_CONVERT_BACK_MICRO_USD = 1_000_000;
+  let pay: PromiseSettledResult<Response>, wd: PromiseSettledResult<any>;
+  try {
+    const plan = await deviceB.planWithdrawal('all');
+    assert.ok(plan.usdMicro > 0n, 'the withdrawal spends the same dollar notes as the payment');
+    [pay, wd] = await Promise.allSettled([
+      mallory.pay('POST', '/v1/search', JSON.stringify({ query: 'device A' }), cost),
+      deviceB.withdraw(plan, SAPLING),
+    ]);
+  } finally {
+    c.MIN_CONVERT_BACK_MICRO_USD = savedMin;
+  }
   const paid = pay.status === 'fulfilled' && pay.value.status === 200;
   const withdrew = wd.status === 'fulfilled' && !!wd.value?.withdrawal_id;
   assert.ok(paid !== withdrew || !paid, `both went through: pay=${paid} withdraw=${withdrew}`);
@@ -954,4 +965,20 @@ test('send-only email: no inbox needed, charged per send, reply address optional
   await assert.rejects(alice.sendEmailDirect({ to: 'Friend <friend@example.com>', subject: 's', text: 'x' }));
   await assert.rejects(alice.sendEmailDirect({ to: 'friend@example.com', subject: 's', text: 'x', replyInboxId: 'ibx_' + 'x'.repeat(32) }));
   assert.equal(alice.balance(USD), mid);
+});
+
+test('withdrawals: credits under the convert-back minimum are refused before anything is spent', { timeout: 120_000 }, async () => {
+  const conf = await (await http(`${base}/v1/config`)).json();
+  assert.equal(conf.withdrawals.min_convert_micro_usd, cfg.MIN_CONVERT_BACK_MICRO_USD);
+  const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(generateMnemonic(wordlist, 256)), NET), book: new NoteBook(), prove: nodeProve, fetch: http });
+  const d = await fresh.startDeposit(10_000_000n, undefined, false); // 0.1 ZEC → ~$2.46 of credits
+  await payInto(d.address, 10_000_000);
+  await until(async () => !!(await fresh.depositStatus(d.slot)).credited);
+  const usd = fresh.balance(USD);
+  assert.ok(usd > 0n && usd < BigInt(cfg.MIN_CONVERT_BACK_MICRO_USD));
+  // "Withdraw all" leaves credits under the minimum as credits; asking for more refuses.
+  const all = await fresh.planWithdrawal('all');
+  assert.equal(all.usdMicro, 0n);
+  await assert.rejects(fresh.planWithdrawal(fresh.balance(ZEC) + 1_000_000n));
+  assert.equal(fresh.balance(USD), usd);
 });

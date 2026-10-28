@@ -81,19 +81,19 @@ async function main() {
     const r = await OneClickService.getQuote({
       dry: true, swapType: QuoteRequest.swapType.EXACT_INPUT, slippageTolerance: cfg.TREASURY_SLIPPAGE_BPS,
       originAsset: cfg.TREASURY_SWAP_ORIGIN_ASSET, depositType: QuoteRequest.depositType.ORIGIN_CHAIN,
-      destinationAsset: cfg.TREASURY_SWAP_DEST_ASSET, amount: '5000000', refundTo: reserve,
+      destinationAsset: cfg.TREASURY_SWAP_DEST_ASSET, amount: String(cfg.CONVERSION_MIN_ZATS), refundTo: reserve,
       refundType: QuoteRequest.refundType.ORIGIN_CHAIN, recipient: who, recipientType: QuoteRequest.recipientType.DESTINATION_CHAIN, deadline,
     } as QuoteRequest);
-    pass(`1Click: 0.05 ZEC → ${usd(BigInt(r.quote.amountOut ?? '0'))} USDC on Base (refunds to the reserve ${short(reserve)})`);
+    pass(`1Click: the smallest conversion Zeep makes (${cfg.CONVERSION_MIN_ZATS / 1e8} ZEC) → ${usd(BigInt(r.quote.amountOut ?? '0'))} USDC on Base (refunds to the reserve ${short(reserve)})`);
   });
   await step('1Click Base USDC → ZEC', async () => {
     const r = await OneClickService.getQuote({
       dry: true, swapType: QuoteRequest.swapType.EXACT_INPUT, slippageTolerance: cfg.TREASURY_SLIPPAGE_BPS,
       originAsset: cfg.TREASURY_SWAP_DEST_ASSET, depositType: QuoteRequest.depositType.ORIGIN_CHAIN,
-      destinationAsset: cfg.TREASURY_SWAP_ORIGIN_ASSET, amount: '5000000', refundTo: who,
+      destinationAsset: cfg.TREASURY_SWAP_ORIGIN_ASSET, amount: String(Math.floor(cfg.MIN_CONVERT_BACK_MICRO_USD * 0.97)), refundTo: who,
       refundType: QuoteRequest.refundType.ORIGIN_CHAIN, recipient: cfg.ZEEP_RESERVE_TADDR!, recipientType: QuoteRequest.recipientType.DESTINATION_CHAIN, deadline,
     } as QuoteRequest);
-    pass(`1Click: $5 USDC → ${(Number(r.quote.amountOut ?? 0) / 1e8).toFixed(6)} ZEC to the reserve ${short(cfg.ZEEP_RESERVE_TADDR!)}`);
+    pass(`1Click: the smallest credit conversion back (${usd(Math.floor(cfg.MIN_CONVERT_BACK_MICRO_USD * 0.97))} after Relay) → ${(Number(r.quote.amountOut ?? 0) / 1e8).toFixed(6)} ZEC to the reserve ${short(cfg.ZEEP_RESERVE_TADDR!)}`);
   });
 
   // ---------------------------------------------------------------- Relay (quotes + simulation)

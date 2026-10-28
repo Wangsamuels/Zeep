@@ -165,6 +165,10 @@ const Env = z.object({
   // Withdrawals: dollars → ZEC at the conversion's actual rate, paid in two tranches
   // (the first right after the ZEC arrives, the second TRANCHE_GAP_SEC later).
   MIN_WITHDRAWAL_MICRO_USD: int(1_000_000),
+  // Credits converted back to ZEC must be at least this much: NEAR Intents takes a fixed
+  // ~0.003 ZEC to deliver ZEC and refuses swaps under ~$1.70, so smaller conversions either
+  // fail after bridging or cost the user most of the amount.
+  MIN_CONVERT_BACK_MICRO_USD: int(5_000_000),
   TRANCHE_GAP_SEC: int(600),
   REFUND_JITTER_SEC: int(180),
   REFUND_SPLIT_BPS: int(5000),
@@ -188,7 +192,7 @@ const Env = z.object({
   // covers (first withdrawal of the day, conversion sends, shielding). Refills itself from the
   // next deposits' surplus; the cost shows up as covered fees in the profit books.
   ZEC_FLOOR_ZATS: int(200_000),
-  CONVERSION_MIN_ZATS: int(100_000),
+  CONVERSION_MIN_ZATS: int(300_000), // NEAR Intents refuses ZEC swaps under ~0.0013 ZEC
   TREASURY_RAILS: z.enum(['live', 'mock']).default('mock'),
   ZEEP_RESERVE_TADDR: z.string().default(''),
   RESERVE_COVERAGE_MIN_BPS: int(10_000),

@@ -105,7 +105,6 @@ src/lib/ohttp.ts, src/routes/ohttp.ts   Oblivious HTTP gateway (shared crypto wi
 src/rails-check.ts               live dry run of rails and provider prices (nothing is sent)
 deploy/cloudflare-worker/        the relay (API + /lwd)
 docs/DEPLOY.md, docs/MAINNET_CONVERSION.md   deployment and the testnet → mainnet conversion
-docs/FRONTEND_UPDATE_*.md        handover notes for the frontend, one per backend change
 ```
 
 ## Money flows
@@ -121,6 +120,7 @@ docs/FRONTEND_UPDATE_*.md        handover notes for the frontend, one per backen
   1. If the ZEC balance covers it, one ZEC proof pays it straight from the shielded reserve. No conversion fee; it is scheduled at once.
   2. If the user wants more, the app shows a prompt and re-authenticates, then sends a second proof from dollar notes. Those dollars go USDC.e → Base → ZEC (`converting`, about 20–60 minutes, 1.5% fee), the ZEC is **shielded on arrival**, and everything is paid together.
   3. Payouts go to a shielded address, or a transparent one with `allow_transparent: true`, in two tranches 10 minutes apart.
+  4. Credits converted back must be at least `MIN_CONVERT_BACK_MICRO_USD` ($5). NEAR Intents refuses Base → ZEC swaps under about $1.70 and keeps a fixed ~0.003 ZEC to deliver ZEC, so smaller conversions would fail or lose most of their value. "Withdraw all" leaves credits under the minimum as credits. Before bridging, the treasury asks NEAR Intents (dry quote) whether it will accept the amount; if not, nothing moves and an ALERT asks for a manual payout.
 
 ## Fees: who pays
 
