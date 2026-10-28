@@ -43,6 +43,7 @@ export default async function publicRoutes(app: FastifyInstance) {
       split: {
         // Each deposit: zec_share_bps stays ZEC, the rest becomes dollars.
         zec_share_bps: cfg.ZEC_SHARE_BPS,
+        all_credits_below_micro_usd: cfg.ALL_CREDITS_BELOW_MICRO_USD, // smaller deposits: no ZEC half
         // Client-side refill of the dollar balance from the ZEC balance.
         refill: { at_bps: cfg.REFILL_AT_BPS, convert_bps: cfg.REFILL_BPS, final_stage: cfg.REFILL_FINAL_STAGE, min_zats: cfg.MIN_CONVERT_ZATS },
         conversion_fee_bps: { zec_to_usd: cfg.DEPOSIT_FEE_BPS, usd_to_zec: cfg.WITHDRAWAL_FEE_BPS },

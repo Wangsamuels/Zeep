@@ -61,6 +61,7 @@ export async function feeSheet() {
     service_markup_bps: cfg.PRICE_MARKUP_BPS,
     deposit: {
       zec_share_bps: cfg.ZEC_SHARE_BPS, // kept as ZEC, no fee
+      all_credits_below_micro_usd: cfg.ALL_CREDITS_BELOW_MICRO_USD, // smaller deposits become credits only
       fee_bps: cfg.DEPOSIT_FEE_BPS, // on the converted half
       first_today_network_fee_back_micro_usd: depFee,
       min_micro_usd_for_free: cfg.FREE_FEE_MIN_MICRO_USD,

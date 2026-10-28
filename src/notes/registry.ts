@@ -202,6 +202,7 @@ class Registry {
   /**
    * Turn confirmed ZEC deposits into two notes each (one dyno at a time):
    *   ZEC note    = ZEC_SHARE_BPS of the zats, kept as ZEC     leaf Poseidon(d_zec, zats, 1)
+   *                 (0 for a deposit worth less than ALL_CREDITS_BELOW_MICRO_USD: all credits)
    *   dollar note = the rest × price − conversion fee (+ rebate) leaf Poseidon(d, micro-USD, 0)
    */
   async creditDeposits(): Promise<number> {
@@ -248,7 +249,9 @@ class Registry {
           if (zats > cap && !(dailyCap !== undefined && zats > dailyCap && cap === dailyCap)) continue;
           cap -= zats;
           done.add(r.intent_id);
-          const kept = Math.floor((zats * cfg.ZEC_SHARE_BPS) / 10_000);
+          // Worth less than ALL_CREDITS_BELOW_MICRO_USD at today's price: all of it becomes credits.
+          const small = zatsToMicroUsd(zats, px) < cfg.ALL_CREDITS_BELOW_MICRO_USD;
+          const kept = small ? 0 : Math.floor((zats * cfg.ZEC_SHARE_BPS) / 10_000);
           const converted = zats - kept;
           // The converted part at today's price, minus the conversion fee; the first deposit of
           // the user's day also gets their wallet's network fee back (if the budget allows).

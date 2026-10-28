@@ -114,6 +114,7 @@ docs/DEPLOY.md, docs/MAINNET_CONVERSION.md   deployment and the testnet → main
   2. The user sends any amount from any wallet. No memo is needed.
   3. On confirmation it becomes two notes: a **ZEC note** of `ZEC_SHARE_BPS` (50%) of the zats, and a **dollar note** of `rest × price − DEPOSIT_FEE_BPS`.
   4. The treasury converts only the dollar half to USDC.e. The ZEC half stays shielded in the reserve.
+  5. **Small deposits become credits only.** A deposit worth less than `ALL_CREDITS_BELOW_MICRO_USD` ($10) has no ZEC half: all of it becomes credits (minus 1.5%), ready for services. Split 50/50, its dollar half would sit under the $5 convert-back minimum.
 - **Pay.** Route prices are in USD plus **4.5%** (`PRICE_MARKUP_BPS`), charged from dollar notes. If an upstream fails, the cost comes back as a new note.
 - **Refill (client-side schedule).** When the dollar balance would fall to `REFILL_AT_BPS` (5%) of its last top-up, the SDK converts `REFILL_BPS` (50%) of the ZEC balance; then 50% of the rest; stage `REFILL_FINAL_STAGE` (3) converts all of it. A deposit resets the stages. `POST /v1/convert/to-usd` burns the ZEC note and mints a dollar note at the live price minus 1.5%. The client proposes the exact amount so its encrypted backup can hold it; the server accepts it within `CONVERT_QUOTE_TOLERANCE_BPS` of its own quote.
 - **Withdraw.**

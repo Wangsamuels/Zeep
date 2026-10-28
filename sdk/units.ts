@@ -43,9 +43,14 @@ export function parseZec(input: string): bigint {
 export const zatsToMicroUsd = (zats: bigint | number, zecUsd: number): number => Math.floor((Number(zats) / 1e8) * zecUsd * 1e6);
 export const bpsOf = (amount: number, bps: number): number => Math.ceil((amount * bps) / 10_000);
 
-/** What a ZEC deposit will add (estimate before it confirms): the ZEC kept, and the dollars from the rest. */
-export function estimateDeposit(zats: bigint, zecUsd: number, zecShareBps: number, feeBps: number): { zecZats: bigint; usdMicro: bigint; totalMicro: bigint } {
-  const kept = (zats * BigInt(zecShareBps)) / 10_000n;
+/**
+ * What a ZEC deposit will add (estimate before it confirms): the ZEC kept, and the dollars from
+ * the rest. A deposit worth less than `allCreditsBelowMicro` (config.split.all_credits_below_micro_usd)
+ * becomes credits only.
+ */
+export function estimateDeposit(zats: bigint, zecUsd: number, zecShareBps: number, feeBps: number, allCreditsBelowMicro = 0): { zecZats: bigint; usdMicro: bigint; totalMicro: bigint } {
+  const small = zatsToMicroUsd(zats, zecUsd) < allCreditsBelowMicro;
+  const kept = small ? 0n : (zats * BigInt(zecShareBps)) / 10_000n;
   const value = zatsToMicroUsd(zats - kept, zecUsd);
   const usd = BigInt(value - bpsOf(value, feeBps));
   return { zecZats: kept, usdMicro: usd, totalMicro: usd + BigInt(zatsToMicroUsd(kept, zecUsd)) };

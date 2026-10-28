@@ -25,7 +25,7 @@ import { checkRedisNetwork } from '../src/lib/redis.js';
 import { checkDbNetwork } from '../src/migrate.js';
 import { reserveBooks } from '../src/services/reserve.js';
 import { housekeeping } from '../src/workers/treasury.js';
-import { chatCostMicro, deriveKeys, NoteBook, ohttpFetch, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
+import { chatCostMicro, deriveKeys, estimateDeposit, NoteBook, ohttpFetch, seedFromPhrase, USD, ZEC, ZeepClient } from '../sdk/index';
 import { innerHeaders, keyConfigs } from '../src/routes/ohttp.js';
 import { b64, decodeRequest, encodeKeyConfig, encodeRequest, parseKeyConfig, REQ_MEDIA, sealRequest } from '../src/lib/ohttp.js';
 const testKeyConfig = () => b64(keyConfigs()[0]);
@@ -116,6 +116,10 @@ const TADDR = (MAIN ? 't1' : 'tm') + 'B'.repeat(33);
 
 test('deposit any ZEC amount → half kept as ZEC, half fixed dollars minus 1.5%; first of the day gets its network fee back', { timeout: 90_000 }, async () => {
   (alice as unknown as { base: string }).base = base;
+  // This test checks the 50/50 split on any amount; small deposits (all credits) have their own test.
+  const smallCfg = cfg as { ALL_CREDITS_BELOW_MICRO_USD: number };
+  const savedSmall = smallCfg.ALL_CREDITS_BELOW_MICRO_USD;
+  smallCfg.ALL_CREDITS_BELOW_MICRO_USD = 0;
   const d1 = await alice.startDeposit(50_000_000n); // the user typed 0.5 ZEC
   const d2 = await alice.startDeposit(12_345_670n); // any amount, no plans
   assert.notEqual(d1.address, d2.address); // a fresh address per deposit, no memo needed
@@ -124,6 +128,7 @@ test('deposit any ZEC amount → half kept as ZEC, half fixed dollars minus 1.5%
   await payInto(d1.address, 50_000_000);
   await payInto(d2.address, 12_345_670);
   await until(async () => (await alice.depositStatus(d1.slot)).credited && (await alice.depositStatus(d2.slot)).credited);
+  smallCfg.ALL_CREDITS_BELOW_MICRO_USD = savedSmall;
   const c1 = (await alice.depositStatus(d1.slot)).credited!;
   const c2 = (await alice.depositStatus(d2.slot)).credited!;
   assert.equal(c1.zec.amount_zats, 25_000_000); // 50% stays ZEC, no fee
@@ -402,12 +407,14 @@ test('a later payment to an already-credited address is found by pollDeposits() 
   assert.ok(!alice.book.pendingDeposits.includes(d.slot));
   assert.ok(alice.book.watchedDeposits[d.slot] > Date.now()); // still watched
   const zec0 = alice.balance(ZEC);
-  await payInto(d.address, 1_000_000); // someone reuses the address later
+  const usd0 = alice.balance(USD);
+  await payInto(d.address, 1_000_000); // someone reuses the address later ($0.50: small, so all credits)
   await until(async () => {
     alice.book.lastWatchCheck = 0; // the app polls every few seconds; the watch runs every 10 min
     await alice.pollDeposits();
-    return alice.balance(ZEC) === zec0 + 500_000n;
+    return alice.balance(USD) >= usd0 + 492_500n;
   });
+  assert.equal(alice.balance(ZEC), zec0);
   await sleep(1500);
   await settleFloat();
 });
@@ -971,8 +978,8 @@ test('withdrawals: credits under the convert-back minimum are refused before any
   const conf = await (await http(`${base}/v1/config`)).json();
   assert.equal(conf.withdrawals.min_convert_micro_usd, cfg.MIN_CONVERT_BACK_MICRO_USD);
   const fresh = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(generateMnemonic(wordlist, 256)), NET), book: new NoteBook(), prove: nodeProve, fetch: http });
-  const d = await fresh.startDeposit(10_000_000n, undefined, false); // 0.1 ZEC → ~$2.46 of credits
-  await payInto(d.address, 10_000_000);
+  const d = await fresh.startDeposit(20_000_000n, undefined, false); // 0.2 ZEC ($10) → ~$4.93 of credits + 0.1 ZEC
+  await payInto(d.address, 20_000_000);
   await until(async () => !!(await fresh.depositStatus(d.slot)).credited);
   const usd = fresh.balance(USD);
   assert.ok(usd > 0n && usd < BigInt(cfg.MIN_CONVERT_BACK_MICRO_USD));
@@ -981,4 +988,31 @@ test('withdrawals: credits under the convert-back minimum are refused before any
   assert.equal(all.usdMicro, 0n);
   await assert.rejects(fresh.planWithdrawal(fresh.balance(ZEC) + 1_000_000n));
   assert.equal(fresh.balance(USD), usd);
+});
+
+test('small deposits (worth under $10) become credits only, so all of it can be used for services', { timeout: 120_000 }, async () => {
+  const conf = await (await http(`${base}/v1/config`)).json();
+  assert.equal(conf.split.all_credits_below_micro_usd, 10_000_000);
+  const small = new ZeepClient({ baseUrl: base, keys: deriveKeys(seedFromPhrase(generateMnemonic(wordlist, 256)), NET), book: new NoteBook(), prove: nodeProve, fetch: http });
+  const d = await small.startDeposit(10_000_000n, undefined, false); // 0.1 ZEC at the $50 test price = $5
+  await payInto(d.address, 10_000_000);
+  await until(async () => !!(await small.depositStatus(d.slot)).credited);
+  const c = (await small.depositStatus(d.slot)).credited!;
+  assert.equal(c.zec.amount_zats, 0); // no ZEC half
+  assert.equal(c.usd.converted_zats, 10_000_000); // all of it converted
+  assert.equal(c.usd.value_micro_usd, 5_000_000);
+  assert.equal(c.usd.fee_micro_usd, 75_000); // 1.5%
+  assert.equal(c.usd.amount_micro_usd, 5_000_000 - 75_000 + c.usd.rebate_micro_usd);
+  assert.deepEqual(small.balances(), { usd: BigInt(c.usd.amount_micro_usd), zec: 0n });
+  // The app's estimate agrees before the deposit lands.
+  const est = estimateDeposit(10_000_000n, 50, conf.split.zec_share_bps, conf.split.conversion_fee_bps.zec_to_usd, conf.split.all_credits_below_micro_usd);
+  assert.deepEqual([est.zecZats, est.usdMicro], [0n, 4_925_000n]);
+  // And it all works for services straight away.
+  const cost = BigInt((await small.prices()).routes.search.micro_usd);
+  assert.equal((await small.pay('POST', '/v1/search', JSON.stringify({ query: 'small deposit' }), cost)).status, 200);
+  // The ZEC behind it is surplus for the float to convert, never owed as ZEC.
+  await sleep(1500);
+  await settleFloat();
+  const b = await reserveBooks();
+  assert.ok(b.usd.coverage_bps >= 10_000 && b.zec.coverage_bps >= 10_000, JSON.stringify({ usd: b.usd.coverage_bps, zec: b.zec.coverage_bps }));
 });

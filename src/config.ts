@@ -138,6 +138,9 @@ const Env = z.object({
   // top-up, the client converts REFILL_BPS of its ZEC to dollars; on stage REFILL_FINAL_STAGE
   // it converts all of it. The schedule runs client-side (the server never sees balances).
   ZEC_SHARE_BPS: int(5000),
+  // Small deposits become credits only (no ZEC half): a deposit worth less than this would leave
+  // a dollar half under the $5 convert-back minimum and a ZEC half too small to be useful.
+  ALL_CREDITS_BELOW_MICRO_USD: int(10_000_000),
   REFILL_AT_BPS: int(500),
   REFILL_BPS: int(5000),
   REFILL_FINAL_STAGE: int(3),
