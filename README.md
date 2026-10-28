@@ -7,6 +7,45 @@ The backend for Zeep. Users deposit **any amount of ZEC**, and it becomes **two 
 
 Each request is paid from the dollar balance with one zero-knowledge proof. The server sees what a request costs, but never anyone's balances, and it can't link one request to another. "Credits" are how the app shows everything a user owns: dollars + ZEC at the live price (default 1 credit = $1). When the dollars run low, the client converts ZEC to dollars in stages (below).
 
+## Live services
+
+Every request is paid with one spend proof. Zeep pays the provider over MPP (Tempo USDC.e) from its float, so providers see Zeep, never the user. Prices are in `/v1/prices`.
+
+| Service | Route | Provider | User price (credits) |
+| --- | --- | --- | --- |
+| Private AI (10 frontier models) | `POST /v1/ai/chat/completions` | OpenRouter MPP gateway | per reply, from the gateway's own quote + 4.5% |
+| Web search | `POST /v1/search` | Exa | 0.0104 |
+| Research (cited answer / multi-hop) | `POST /v1/research` | Parallel | 0.031 / 0.063 / 0.209 (base / core / pro) |
+| Health lookup (drugs, trials) | `POST /v1/health/lookup` | RxAtlas, TrialBase | 0.1045 |
+| Send-only email (no inbox needed) | `POST /v1/email/send` | StableEmail (shared relay address) | 0.026 |
+| Anonymous inbox (own address, 30 days) | `POST /v1/inbox` (+ list, read, send, reply, delete) | AgentMail | 2.09, then 0.0105 per send |
+| Encrypted vault (chats, settings) | `/v1/vault/*` | Zeep (Postgres) | free |
+
+**No service can cost the treasury more than the user paid:**
+
+- AI replies are priced from the gateway's 402 quote for the exact request (fetched without paying), never below it. The SDK pays that exact price once if its own estimate was low.
+- `mppFetch` refuses to sign any provider payment above what the user paid for that request, and free routes can't pay anything. The user is refunded.
+- The config refuses any route price below the provider's price (`PROVIDER_COST_USD` in `src/config.ts`).
+- `node dist/rails-check.js` compares every provider's live price with Zeep's.
+
+## Network privacy: relay + Oblivious HTTP
+
+```
+browser ──OHTTP (encrypted, padded)──▶ Cloudflare Worker relay ──▶ Heroku /ohttp ──▶ the normal routes, in-process
+in-app wallet ──gRPC-web──▶ relay /lwd ──▶ ChainSafe gRPC-web proxy ──▶ zec.rocks
+```
+
+- **The relay** (`deploy/cloudflare-worker/`) forwards only an allowlist of headers, adds the relay secret, and strips query strings plus Heroku's error-report headers. Heroku refuses anything that didn't come through it (`REQUIRE_RELAY`), so its router never logs a user's IP.
+- **OHTTP** (RFC 9458 + chunked OHTTP, HPKE X25519 / HKDF-SHA256 / AES-128-GCM; `src/lib/ohttp.ts` = `sdk/ohttp.ts`):
+  - every API call is encrypted to Zeep's key and posted to `POST /ohttp`;
+  - the relay sees the user's IP but only ciphertext: no route, headers, ids, proofs or content;
+  - Zeep's server sees the request but never the IP;
+  - requests and replies are padded to size buckets, and streamed AI replies are sent in timed, padded batches, so lengths and token counts don't show;
+  - a cut or tampered message fails closed.
+- **The OHTTP key ships with the frontend build** (`NEXT_PUBLIC_OHTTP_KEY_CONFIG`), never fetched through the relay. `REQUIRE_OHTTP=true` refuses every plain API call.
+- **Light-wallet traffic** goes through the relay's `/lwd` path, so the light-wallet server never sees the user's IP.
+- **Still visible:** Cloudflare sees that an IP uses Zeep and when, plus the wallet's sync traffic; Vercel sees page loads. Zeep runs the relay, so an independent relay operator would be the next step.
+
 ## How the private balances work
 
 Balances are sets of **notes**, which work like Zcash's own shielded notes. Each note has an `asset` (0 = dollars in micro-USD, 1 = ZEC in zats) and is defined as follows:
@@ -62,7 +101,11 @@ src/services/prices.ts           USD prices (+ 4.5%) in micro-USD; ZEC price for
 src/services/fees.ts             deposit / withdrawal fees, covered-fee budget, profit floor
 src/treasury/                    Tempo float: conversions and the NEAR Intents / Relay rails
 sdk/                             client SDK (browser + Node): keys, notes, proving, pay, refill, deposit, withdraw, restore
-docs/FRONTEND_BRIEF.md           what the frontend must change, and the config files it needs
+src/lib/ohttp.ts, src/routes/ohttp.ts   Oblivious HTTP gateway (shared crypto with sdk/ohttp.ts)
+src/rails-check.ts               live dry run of rails and provider prices (nothing is sent)
+deploy/cloudflare-worker/        the relay (API + /lwd)
+docs/DEPLOY.md, docs/MAINNET_CONVERSION.md   deployment and the testnet → mainnet conversion
+docs/FRONTEND_UPDATE_*.md        handover notes for the frontend, one per backend change
 ```
 
 ## Money flows
@@ -115,7 +158,7 @@ The reserve holds each asset against its own notes, so neither side depends on Z
 
 ## Testnet and mainnet never mix
 
-Run each network as its **own Heroku app with its own Postgres and Redis**. Every process checks this at boot and refuses to start otherwise:
+Each network gets its **own Postgres and Redis**. The live deployment is one Heroku app converted from testnet to mainnet (`deploy/convert-to-mainnet.sh` erases the testnet data). Every process checks this at boot and refuses to start otherwise:
 
 - **Config.**
   - `ZEEP_ENV` and `ZCASH_NETWORK` must match (`testnet`/`test`, `mainnet`/`main`).
@@ -124,7 +167,8 @@ Run each network as its **own Heroku app with its own Postgres and Redis**. Ever
   - `TREASURY_RAILS=live` and `MPP_MODE=live`;
   - a pinned `SPEND_VKEY_SHA256`;
   - a live ZEC price (no fallback);
-  - `REQUIRE_RELAY=true`.
+  - `REQUIRE_RELAY=true`;
+  - `OHTTP_PRIVATE_KEY` (and, once the frontend sends OHTTP, `REQUIRE_OHTTP=true`).
 - **Testnet** can never move real money:
   - the rails are always simulated;
   - live paid services need `TESTNET_LIVE_MPP=true`.
@@ -157,6 +201,7 @@ Run each network as its **own Heroku app with its own Postgres and Redis**. Ever
 
 ## Privacy rules
 
+- **No IPs anywhere.** The server deletes IP headers before any handler runs, logs only route, status and latency (`logger: false`, `trustProxy: false`), and has no IP or user-agent column. The tests check all three.
 - **Spent-note checks** go by bucket (`/v1/nullifiers/buckets`). Clients never send their exact nullifiers.
 - **Bearer ids stay out of URLs.** Deposit intent ids, withdrawal ids and the vault id travel in request bodies or headers, never in URL paths, which Heroku's router logs.
 - **`/v1/reserve`** is published hourly and rounded to $1 and 0.01 ZEC.
@@ -180,9 +225,10 @@ npm run migrate:dev && npm run dev
 (cd rust && CHAIN_BACKEND=dev cargo run --bin zeep-watcher)
 (cd rust && CHAIN_BACKEND=dev PAYOUT_ADDR_ENC_KEY=... cargo run --bin zeep-payouts)
 
-npm test                                        # 16 unit tests
-npm run test:e2e                                # 12 end-to-end tests, testnet settings
-ZEEP_E2E_NETWORK=mainnet npm run test:e2e       # the same 12 with mainnet settings (own DB zeep_mainnet_test, Redis db 1)
+npm test                                        # 23 unit tests
+npm run test:e2e                                # 36 end-to-end tests, testnet settings
+ZEEP_E2E_NETWORK=mainnet npm run test:e2e       # the same 36 with mainnet settings (own DB zeep_mainnet_test, Redis db 1)
+ZEEP_E2E_OHTTP=1 npm run test:e2e               # every call through OHTTP, with plain calls refused (combine with the line above)
 (cd rust && cargo test)
 ```
 
@@ -199,6 +245,9 @@ The end-to-end tests run the SDK the same way the app will:
 
 They also cover these safety cases:
 
+- **attacks on the money path:** the same proof sent twice at once, a captured proof reused for another route or body, under- and overpaying, a failed provider (refunded exactly once), two devices spending the same notes at once; the books balance after each;
+- **privacy:** no IP, user agent or smuggled header reaches a handler, a log or the database; OHTTP sizes are padded, and tampering, an unknown key or a cut reply fail closed;
+- **services:** metered AI pricing and its one-time correction, model switching mid-chat, the daily spending limit, research, health, the full inbox and send-only email;
 - housekeeping never touches a converting withdrawal;
 - two payments to one address are credited once each, with no duplicate notes;
 - confirming deposits count as owed;
@@ -215,8 +264,9 @@ The mainnet run uses `u1`/`zs1`/`t1` addresses, the mainnet model list and no te
 - **Chain backend.** `lightclient` (recommended, no VPS), `rpc` (Zallet) and `dev` all work.
   - The light client is built on `zcash_client_backend` 0.25 and `zcash_client_sqlite` 0.23, which are Ironwood-ready. It receives in Sapling, Orchard and Ironwood, and sends change into Ironwood from NU6.3 on.
   - **Tested live on testnet** against zec.rocks: wallet creation, failover, sync, deposit addresses, saving and restoring through Postgres, and network/address checks.
-  - **Not yet tested with real funds:** receiving a deposit, a payout send and shielding. These need testnet ZEC; do them first after deploying (docs/DEPLOY.md §9).
-- **Provider paths.** StableEmail, RxAtlas, TrialBase and Parallel are best guesses. Confirm them during your day-1 endpoint checks (`PROVIDERS` in `src/routes/services.ts`).
+  - **Tested on testnet with real testnet ZEC:** receiving a deposit and claiming it, and withdrawals coming back to Zeep's own addresses.
+  - **Live on mainnet:** sync, deposit addresses, NEAR Intents and Relay quotes both ways (`rails-check`). A real mainnet deposit, conversion and payout haven't run yet: do a small one first.
+- **Provider paths and prices** were checked against each provider's live 402 challenge (Oct 2026). Re-check any time with `heroku run -a <app> -- node dist/rails-check.js`.
 - **Fee levels.** The 1.5% deposit and withdrawal fees assume each conversion costs about 1%. Watch `profit.conversion_costs_micro_usd` against `profit.conversion_fees_micro_usd` in `/v1/reserve` during testnet. If real slippage runs higher (the cap is `TREASURY_SLIPPAGE_BPS`, 1%), raise the fees.
 - **Credit-to-conversion gap.** A deposit's dollar half (and a refill) is credited at the price when it confirms and converted a minute or so later. The fee absorbs small moves in between.
 - **Profit floor.** With a 1% mock conversion cost, the 1.5% fees leave about 0.5% per conversion, so profit is below 1% of dollar volume in the tests and covered network fees pause on their own. If you want the 1% floor met from conversions alone, raise `DEPOSIT_FEE_BPS` / `WITHDRAWAL_FEE_BPS` or watch the real costs on testnet first.

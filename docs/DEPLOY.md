@@ -139,13 +139,14 @@ heroku ps:scale -a zeep-test web=1 treasury=1 wallet=1:standard-2x watcher=0 pay
 
 ## 7. Frontend (Vercel), one project per network
 
-Follow `docs/FRONTEND_BRIEF.md` §9. The key values:
+Set these in Vercel (the `docs/FRONTEND_UPDATE_*.md` notes cover the frontend code). The key values:
 
 | Var | Testnet | Mainnet |
 | --- | --- | --- |
 | `NEXT_PUBLIC_ZEEP_NETWORK` | `testnet` | `mainnet` |
 | API base URL | testnet Worker URL | mainnet Worker URL |
-| `NEXT_PUBLIC_LIGHTWALLETD_URL_TESTNET` / `_MAINNET` | `https://testnet.zec.rocks:443` | `https://zec.rocks:443` |
+| `NEXT_PUBLIC_LIGHTWALLETD_URL_TESTNET` / `_MAINNET` | testnet Worker URL + `/lwd` | mainnet Worker URL + `/lwd` |
+| `NEXT_PUBLIC_OHTTP_KEY_CONFIG` | from `node dist/ohttp-config.js` | same, on the mainnet app |
 | `NEXT_PUBLIC_SPEND_*` | circuit URLs + the same hashes | same |
 
 ## 8. Hot cap and hackathon safety limits
