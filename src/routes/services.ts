@@ -31,6 +31,30 @@ export const PROVIDERS = {
   trialbase: (query: string) => `${cfg.MPP_TRIALBASE_URL}/v1/trials?q=${encodeURIComponent(query)}&limit=5`,
 };
 
+const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+const join = (parts: unknown[]) => parts.map((p) => (Array.isArray(p) ? p.filter(Boolean).join(', ') : p)).filter((p) => p !== undefined && p !== null && p !== '').join(' · ');
+
+/** One RxAtlas drug product or TrialBase trial as a list item. */
+export function healthItem(kind: 'drug' | 'trial', r: Record<string, any>): { id: unknown; title: string; snippet: string; url?: string } {
+  if (kind === 'drug') {
+    const title = str(r.brand_name) ?? str(r.generic_name) ?? `Drug product ${r.id}`;
+    const snippet = join([
+      str(r.generic_name) !== title ? str(r.generic_name) : undefined, str(r.strength), str(r.dosage_form), str(r.route),
+      str(r.manufacturer_name), str(r.canonical_product_ndc) ? `NDC ${r.canonical_product_ndc}` : undefined,
+      r.has_recall ? 'Recall on record' : undefined, str(r.shortage_status) ? `Shortage: ${r.shortage_status}` : undefined,
+    ]);
+    return { id: r.id, title, snippet };
+  }
+  const title = str(r.brief_title) ?? str(r.title) ?? str(r.registry_id) ?? `Trial ${r.id}`;
+  const snippet = join([
+    str(r.registry_id), str(r.status) ? `Status: ${r.status}` : undefined, str(r.phase), str(r.study_type),
+    Array.isArray(r.conditions) ? r.conditions.slice(0, 3) : undefined, Array.isArray(r.countries) ? r.countries.slice(0, 3) : undefined,
+    str(r.start_date) ? `Started ${r.start_date}` : undefined, typeof r.enrollment_count === 'number' ? `${r.enrollment_count} enrolled` : undefined,
+  ]);
+  const url = str(r.source_record_url);
+  return { id: r.id, title, snippet, ...(url && /^https:\/\//.test(url) ? { url } : {}) };
+}
+
 /** Text and citations from an OpenAI-format Response or a Parallel task result. */
 function researchResult(r: any): { content: string; citations: unknown[] } {
   const o = r?.result ?? r;
@@ -115,7 +139,10 @@ export default async function serviceRoutes(app: FastifyInstance) {
     const c = await chargeRequest(req, reply, routeUsd('health'));
     return withCharge(c, reply, async () => {
       const url = b.data.kind === 'drug' ? PROVIDERS.rxatlas(b.data.query) : PROVIDERS.trialbase(b.data.query);
-      const data = await upstreamJson(await mppFetch('health', url, { method: 'GET' }));
+      const raw = (await upstreamJson(await mppFetch('health', url, { method: 'GET' }))) as { data?: unknown[]; total?: number };
+      // RxAtlas / TrialBase return { data: [records], total }: turn each record into
+      // { title, snippet, url } so the app can list it.
+      const data = (Array.isArray(raw?.data) ? raw.data : []).map((r) => healthItem(b.data.kind, r as Record<string, any>));
       let summary: string | undefined;
       if (b.data.summarize && cfg.MODAL_LLM_BASE_URL) {
         summary = await summarize(
@@ -123,7 +150,8 @@ export default async function serviceRoutes(app: FastifyInstance) {
           JSON.stringify(data).slice(0, 12_000),
         ).catch(() => undefined);
       }
-      return { kind: b.data.kind, data, summary, disclaimer: 'Reference information only, not medical advice.' };
+      if (!summary && !data.length) summary = `No ${b.data.kind === 'drug' ? 'drug products' : 'clinical trials'} matched "${b.data.query}". Try another name or spelling.`;
+      return { kind: b.data.kind, data, total: typeof raw?.total === 'number' ? raw.total : data.length, summary, disclaimer: 'Reference information only, not medical advice.' };
     });
   });
 

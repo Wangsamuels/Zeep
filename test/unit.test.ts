@@ -399,3 +399,14 @@ test('providers: the AI price check reads the USDC.e offer from a 402 without pa
     srv.close();
   }
 });
+
+test('health: RxAtlas and TrialBase records become readable list items; empty results say so', async () => {
+  const { healthItem } = await import('../src/routes/services.js');
+  const d = healthItem('drug', { id: 1, brand_name: 'LIPITOR', generic_name: 'Atorvastatin calcium', strength: '20 mg/1', dosage_form: 'TABLET', route: 'ORAL', manufacturer_name: 'Pfizer', has_recall: false });
+  assert.deepEqual(d, { id: 1, title: 'LIPITOR', snippet: 'Atorvastatin calcium · 20 mg/1 · TABLET · ORAL · Pfizer' });
+  const t = healthItem('trial', { id: 2, registry_id: 'NCT01', brief_title: 'Asthma study', status: 'recruiting', phase: 'PHASE3', conditions: ['Asthma'], source_record_url: 'javascript:alert(1)' });
+  assert.equal(t.title, 'Asthma study');
+  assert.equal(t.snippet, 'NCT01 · Status: recruiting · PHASE3 · Asthma');
+  assert.equal(t.url, undefined); // only https links pass through
+  assert.equal(healthItem('drug', { id: 3 }).title, 'Drug product 3');
+});

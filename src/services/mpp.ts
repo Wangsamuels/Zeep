@@ -167,7 +167,9 @@ function mockResponse(service: string, url: string): Response {
     },
     search: { results: [{ title: 'Mock result', url: 'https://example.com', snippet: 'mock' }] },
     research: { run_id: 'trun_mock', status: 'completed', output_text: 'mock research report', result: { output: { content: 'mock research report', basis: [] } } },
-    health: { results: [{ name: 'mock', summary: 'mock record' }] },
+    health: url.includes('/v1/trials')
+      ? { data: [{ id: 679751, registry_id: 'ISRCTN17465883', brief_title: 'Mock trial', status: 'recruiting', study_type: 'INTERVENTIONAL', countries: ['Israel'], start_date: '2022-06-07', enrollment_count: 3829, source_record_url: 'https://www.isrctn.com/ISRCTN17465883' }], has_more: false, next_cursor: null, total: 1 }
+      : { data: [{ id: 147244, canonical_product_ndc: '75834-258', brand_name: 'ATORVASTATIN CALCIUM TABLET', generic_name: 'Atorvastatin calcium', manufacturer_name: 'NIVAGEN', dosage_form: 'TABLET', route: 'ORAL', strength: '80 mg/1', has_recall: true }], has_more: false, next_cursor: null, total: 1 },
     inbox: { inbox_id: `mock-${Date.now()}@example.com`, email: `mock-${Date.now()}@example.com`, inbox: `mock-${Date.now()}@example.com` },
     'inbox-send': { message_id: `mock-sent-${Date.now()}`, thread_id: 'mock-thread-1', messageId: `mock-sent-${Date.now()}` },
     'inbox-delete': { success: true },

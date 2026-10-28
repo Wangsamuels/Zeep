@@ -954,7 +954,13 @@ test('research (answers and multi-hop tasks) and health lookups work and cost at
   for (const kind of ['drug', 'trial'] as const) {
     const r = await alice.pay('POST', '/v1/health/lookup', JSON.stringify({ kind, query: 'aspirin', summarize: false }), BigInt(p.routes.health.micro_usd));
     assert.equal(r.status, 200, kind);
-    assert.ok((await r.json()).data, kind);
+    const j = await r.json();
+    // Records come back as list items the app can show: title + snippet (+ link for trials).
+    assert.ok(Array.isArray(j.data) && j.data.length === 1, kind);
+    assert.match(j.data[0].title, kind === 'drug' ? /ATORVASTATIN/ : /Mock trial/);
+    assert.match(j.data[0].snippet, kind === 'drug' ? /80 mg\/1 · TABLET · ORAL/ : /ISRCTN17465883 · Status: recruiting/);
+    if (kind === 'trial') assert.equal(j.data[0].url, 'https://www.isrctn.com/ISRCTN17465883');
+    assert.equal(j.total, 1);
   }
 });
 
